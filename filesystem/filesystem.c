@@ -10,19 +10,19 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <string.h>
 #include <math.h>
+#include <string.h>
 #include <limits.h>
 
-#define NAME_MAX_LENGTH 11			// Maximum length of name (with extension)
 #define BUFF_SIZE 256				// Buffer size for input commands
 #define CLUSTER_SIZE 1024
-#define BYTE 1
+#define MAX_SIZE 529408				// Maximum size of the file which can be stored in the filesystem (517 * 1024)
 #define ERROR -1
 #define NO_ERROR 0
 
 #define FNF "FILE NOT FOUND\n"
 #define PNF "PATH NOT FOUND\n"
+#define TL "FILE IS TOO LARGE"
 #define EXIST "EXIST\n"
 #define NE "NOT EMPTY\n"
 #define OK "OK\n"
@@ -31,9 +31,6 @@
 
 
 struct superblock {
- //   char signature[9];              //login autora FS
- //   char volume_descriptor[251];    //popis vygenerovaného FS
- 
     int32_t disk_size;              // Filesystem size
     int32_t cluster_size;           // Cluster size
     int32_t cluster_count;          // Count of clusters
@@ -76,6 +73,15 @@ typedef struct thedirectory {
 	directory_item *file;			// Reference to the first file in the list of all files in the current directory
 } directory;	
 
+
+typedef struct thedata_info {
+	int32_t nodeid;				// I-node id which contains this data block
+	int32_t *ref_addr;			// Address of the direct/indirect reference where this data block is stored
+								// NULL - if this data block is only in the block referenced by indirect reference
+	long addr_in_indirect;		// address in the file where number of this block is stored
+} data_info;
+
+
 void cp(char *files);
 void mv(char *files);
 void rm(char *file);
@@ -98,26 +104,36 @@ int32_t get_size(char *size);
 int32_t find_free_inode();
 int32_t *find_free_data_blocks(int count);
 int parse_path(char *path, char **name, directory **dir);
+directory_item *find_item(directory_item *first_item, char *name);
+int32_t *get_data_blocks(int32_t nodeid, int *block_count, int *rest);
 int create_directory(directory *parent, char *name);
+int test_existence(directory *dir, char *name);
 directory_item *create_directory_item(int32_t inode_id, char *name);
 directory *find_directory(char *path);
+void initialize_inode(int32_t id, int32_t size, int block_count, int tmp_count, int *last_block_index, int32_t *blocks);
 void free_directories(directory *root);
 void clear_inode(int id);
 void update_sizes(directory *dir, int32_t size);
 void print_info(directory_item *item);
-void print_file(int32_t inode_id);
+void print_file(directory_item *item);
 void print_format_msg();
 
-void update_bitmap(int id, int action);
+data_info *create_data_info(int32_t nodeid, int32_t *ref_addr, long addr_in_indirect);
+data_info **map_data_blocks(int *count_of_full_blocks);
+void switch_blocks(int from, int to, data_info **info_blocks);
+
+void update_bitmap(directory_item *item, int8_t value, int32_t *data_blocks, int b_count);
 void update_inode(int id);
 void load_fs();
 void load_directory(directory *dir, int id);
-int update_directory(int32_t id, directory_item *item, int action);
+int update_directory(directory *dir, directory_item *item, int action);
+void remove_reference(directory_item *item, int32_t block_id);
 
 const int32_t INODE_SIZE = 38;			// Size of the i-node in bytes
 const int32_t FREE = -1;					// item is free
 const char *DELIM = " \n"; 
 
+char *fs_name;							// Filesystem name
 FILE *fs;								// File with filesystem
 struct superblock *sb;					// Superblock
 int8_t *bitmap = NULL;					// Bitmap of data blocks, 0 = free	1 = full
@@ -129,32 +145,27 @@ char block_buffer[CLUSTER_SIZE];		// Buffer for one cluster
 int file_input = 0;
 
 
-
-
 /* 	***************************************************
 	Entry point of the program	
 	
 	param argv[1] ... name of the filesystem
 */
 int main(int argc, char *argv[]) {
-	
-	// Test if argument exists
 	if (argc < 2) {
 		printf("No argument! Enter the filesystem name.\n");
 		return EXIT_FAILURE;
 	}
+	
 	printf("Filesystem is running...\n");
+	fs_name = argv[1];
 	
 	// Test if filesystem already exists
 	if (access(argv[1], F_OK) == -1) {
-		// Create new filesystem
 		fs_formatted = 0;
 		printf("The filesystem has to be formatted first.\nUsage: format [size]\n");
-		fs = fopen(argv[1], "wb+");
 	}
 	else {
 		fs_formatted = 1;
-		fs = fopen(argv[1], "rb+");
 		load_fs();
 	}
 	
@@ -167,14 +178,13 @@ int main(int argc, char *argv[]) {
 
 /*	Process user commands */
 int run() {
-	short exit = 0;
-	char buffer[BUFF_SIZE] = {0};
+	short exit = 0;	
+	char buffer[BUFF_SIZE];	// User commands buffer
 	char *cmd, *args;
-	FILE *f;
-	int32_t size;	// Size of the filesystem
+	FILE *f;	// File from which can be loaded commands instead of console
+	int32_t fs_size;	// Size of the filesystem
 	
 	do {
-		// Load user command into buffer
 		memset(buffer, 0, BUFF_SIZE);
 
 		if (file_input) {	// Commands from the file
@@ -182,7 +192,7 @@ int run() {
 			if (!feof(f)) {
 				printf("%s", buffer);
 			}
-			else {
+			else { // Switch back to the commands from the console
 				file_input = 0;
 				fclose(f);
 				continue;
@@ -192,7 +202,7 @@ int run() {
 			fgets(buffer, BUFF_SIZE, stdin);
 		}
 		
-		if (buffer[0] == '\n')
+		if (buffer[0] == '\n')	// Skip an empty line
 			continue;
 		
 
@@ -239,15 +249,15 @@ int run() {
 			f = load(args);
 		}
 		else if (strcmp("format", cmd) == 0) {
-			size = get_size(buffer + strlen(cmd) + 1);
-			if (size == -1)		// Problem with the size of the filesystem
+			fs_size = get_size(buffer + strlen(cmd) + 1);
+			if (fs_size == ERROR)		// Problem with the size of the filesystem
 				continue;
-			format(size);
+			format(fs_size);
 		}
 		else if (strcmp("defrag", cmd) == 0) {
 			defrag();
 		}
-		else if (buffer[0] == 'q') {
+		else if (buffer[0] == 'q') {	// Exiting command
 			exit = 1;
 		}
 		else {
@@ -256,173 +266,114 @@ int run() {
 	} while (!exit);
 }
 
-/* Perform all needed operations before exit */
+/* Perform all needed operations before exiting the program */
 void shutdown() {
 	if (sb) free(sb);
 	if (bitmap) free(bitmap);
 	if (inodes) free(inodes);
-	free_directories(directories[0]);
-	free(directories);
+	if (directories) {
+		free_directories(directories[0]);
+		free(directories);
+	}
 	fclose(fs);
 }
 
 /*	******************************** Filesystem commands *********************************	*/
 
+/*	Copy file to another directory
+
+	param files ... source file (+path) and destination directory (+path)
+*/
 void cp(char *files) {
-	int i, block_count, rest, tmp, tmp2, last_block;
+	int i, block_count, rest, count_with_indir, tmp, last_block_index;
 	int32_t *source_blocks, *dest_blocks, inode_id;
 	char *source, *dest, *name;
 	directory *source_dir, *dest_dir;
 	directory_item *item, **pitem;
-	inode source_node;
 	
 	if (!fs_formatted) {
 		print_format_msg();
 		return;	
 	}
 	
-	source = strtok(files, " ");
-	dest = strtok(NULL, "\n");
+	if (!files || files == "") { // No arguments
+		printf(FNF);
+		return;
+	}
+	source = strtok(files, " ");	// Get source
+	dest = strtok(NULL, "\n");		// Get destination
+	if (!dest || dest == "") {
+		printf(FNF);
+		return;
+	}
 	
+	// Parse the source path + find the source directory
 	if (parse_path(source, &name, &source_dir)) {
 		printf(FNF);
 		return;
 	}
 	
-	item = source_dir->file;
-	while (item != NULL) {
-		if (strcmp(name, item->item_name) == 0) {
-			source_node = inodes[item->inode];
-			break;
-		}
-		item = item->next;
-	}
-	
+	// Find the file in the source directory
+	item = find_item(source_dir->file, name);
 	if (!item) {
 		printf(FNF);
 		return;
 	}
 	
+	// Find the destination directory
 	dest_dir = find_directory(dest);
 	if (!dest_dir) {
 		printf(PNF);
 		return;
 	}
 	
-	
-	block_count = source_node.file_size / CLUSTER_SIZE;
-	rest = source_node.file_size % CLUSTER_SIZE;
-	if (rest != 0)
-		block_count++;
-		
-	source_blocks = (int32_t *)malloc(block_count);
-	
-	source_blocks[0] = source_node.direct1;
-	if (block_count > 1) {
-		source_blocks[1] = source_node.direct2;
-		if (block_count > 2) {
-			source_blocks[2] = source_node.direct3;
-			if (block_count > 3) {
-				source_blocks[3] = source_node.direct4;
-				if (block_count > 4) {
-					source_blocks[4] = source_node.direct5;
-					if (block_count > 5) {
-						if (block_count > 261) {
-							fseek(fs, sb->data_start_address + source_node.indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fread(&source_blocks[5], sizeof(int32_t), 256, fs);
-							
-							tmp = block_count - 261;
-							fseek(fs, sb->data_start_address + source_node.indirect2 * CLUSTER_SIZE, SEEK_SET);
-							fread(&source_blocks[261], sizeof(int32_t), tmp, fs);
-						}
-						else {
-							tmp = block_count - 5;
-							fseek(fs, sb->data_start_address + source_node.indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fread(&source_blocks[5], sizeof(int32_t), tmp, fs);
-						}
-					}
-				}
-			}
-		}
+	// Test if destination folder doesn't contain file/directory with the same name
+	if (test_existence(dest_dir, name)) {
+		printf(EXIST);
+		return;
 	}
 	
-	if (block_count < 5)	// Use only direct references
-		tmp = block_count;
-	else if ((block_count > 5) && (block_count < 262))	// Use first indirect reference (+1 data block)
-		tmp = block_count + 1;
-	else 
-		tmp = block_count + 2;			// Use both indirect references (+2 data block)
+	// Get numbers of data blocks of the source file
+	source_blocks = get_data_blocks(item->inode, &block_count, &rest);
 	
-	dest_blocks = find_free_data_blocks(tmp);
+	if (block_count < 5)								// Use only direct references
+		count_with_indir = block_count;
+	else if ((block_count > 5) && (block_count < 262))	// Use first indirect reference (+1 data block)
+		count_with_indir = block_count + 1;
+	else 
+		count_with_indir = block_count + 2;				// Use both indirect references (+2 data block)
+	
+	// Get numbers of free data blocks for copied file 
+	dest_blocks = find_free_data_blocks(count_with_indir);
 	if (!dest_blocks) {
 		printf(NES);
 		return;
 	}
 	
+	// Get ID of a free i-node
 	inode_id = find_free_inode();
 	if (inode_id == ERROR) {
 		printf(NES);
 		return;
 	}
 	
+	// Get the last (free) item in the list of all files in the destination directory
 	pitem = &(dest_dir->file);
 	while (*pitem != NULL) {
 		pitem = &((*pitem)->next);
 	}
 	*pitem = create_directory_item(inode_id, name);
-		
-	inodes[inode_id].nodeid = inode_id;
-	inodes[inode_id].isDirectory = 0;
-	inodes[inode_id].references = 1;
-	inodes[inode_id].file_size = source_node.file_size;
-	inodes[inode_id].direct1 = dest_blocks[0];
-	last_block = 0;
-	if (block_count > 1) {
-		inodes[inode_id].direct2 = dest_blocks[1];
-		last_block = 1;
-		if (block_count > 2) {
-			inodes[inode_id].direct3 = dest_blocks[2];
-			last_block = 2;
-			if (block_count > 3) {
-				inodes[inode_id].direct4 = dest_blocks[3];
-				last_block = 3;
-				if (block_count > 4) {
-					inodes[inode_id].direct5 = dest_blocks[4];
-					last_block = 4;
-					if (block_count > 5) {
-						inodes[inode_id].indirect1 = dest_blocks[tmp - 1];
-						last_block = tmp - 2;
-						
-						if (block_count > 261) {
-							inodes[inode_id].indirect2 = dest_blocks[tmp - 2];
-							last_block = tmp - 3;
-							fseek(fs, sb->data_start_address + inodes[inode_id].indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fwrite(&dest_blocks[5], sizeof(int32_t), 256, fs);
-							
-							tmp2 = block_count - 261;
-							fseek(fs, sb->data_start_address + inodes[inode_id].indirect2 * CLUSTER_SIZE, SEEK_SET);
-							fwrite(&dest_blocks[261], sizeof(int32_t), tmp2, fs);
-						}
-						else  {
-							tmp2 = block_count - 5;
-							fseek(fs, sb->data_start_address + inodes[inode_id].indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fwrite(&dest_blocks[5], sizeof(int32_t), tmp2, fs);
-						}
-					}
-				}
-			}
-		}
-	}
 	
-	for (i = 0; i < tmp; i++) {
-		bitmap[dest_blocks[i]] = 1;
-	}
-	
-	update_bitmap(inode_id, 1);
+	// Initialize i-node
+	initialize_inode(inode_id, inodes[item->inode].file_size, block_count, count_with_indir, &last_block_index, dest_blocks);
+
+	// Save changes to the file
+	update_bitmap(*pitem, 1, dest_blocks, block_count);
 	update_inode(inode_id);
-	update_directory(dest_dir->current->inode, *pitem, 1);
-	update_sizes(dest_dir, source_node.file_size);
+	update_directory(dest_dir, *pitem, 1);
+	update_sizes(dest_dir, inodes[item->inode].file_size);
 	
+	// Copy data blocks
 	for (i = 0; i < block_count - 1; i++) {
 		fseek(fs, sb->data_start_address + source_blocks[i] * CLUSTER_SIZE, SEEK_SET);
 		fflush(fs);
@@ -432,6 +383,7 @@ void cp(char *files) {
 		fwrite(block_buffer, sizeof(block_buffer), 1, fs);
 	}
 	
+	// Copy the last data block (may copy only a part of the block)
 	memset(block_buffer, 0, CLUSTER_SIZE);
 	if (rest != 0)
 		tmp = rest;
@@ -441,7 +393,7 @@ void cp(char *files) {
 	fseek(fs, sb->data_start_address + source_blocks[block_count - 1] * CLUSTER_SIZE, SEEK_SET);
 	fflush(fs);
 	fread(block_buffer, tmp, 1, fs);
-	fseek(fs, sb->data_start_address + dest_blocks[last_block] * CLUSTER_SIZE, SEEK_SET);
+	fseek(fs, sb->data_start_address + dest_blocks[last_block_index] * CLUSTER_SIZE, SEEK_SET);
 	fflush(fs);
 	fwrite(block_buffer, tmp, 1, fs);
 	fflush(fs);
@@ -454,6 +406,10 @@ void cp(char *files) {
 }
 
 
+/*	Move file to another directory
+
+	param files ... source file (+path) and destination directory (+path)
+*/
 void mv(char *files) {
 	char *source, *dest, *name;
 	directory *source_dir, *dest_dir;
@@ -464,20 +420,49 @@ void mv(char *files) {
 		return;	
 	}
 	
-	source = strtok(files, " ");
-	dest = strtok(NULL, "\n");
+	if (!files || files == "") { // No arguments
+		printf(FNF);
+		return;
+	}
+	source = strtok(files, " ");	// Get source
+	dest = strtok(NULL, "\n");		// Get destination
+	if (!dest || dest == "") {
+		printf(FNF);
+		return;
+	}
 	
+	// Parse the source path + find the source directory
 	if (parse_path(source, &name, &source_dir)) {
 		printf(FNF);
 		return;
 	}
 	
-	temp = &(source_dir->file); // Previous item 
+	// Find the destination directory
+	dest_dir = find_directory(dest);
+	if (!dest_dir) {
+		printf(PNF);
+		return;
+	}
+	
+	// If source and destination directories are the same
+	if (dest_dir == source_dir) {
+		printf(OK);
+		return;
+	}
+	
+	// Test if destination folder doesn't contain file/directory with the same name
+	if (test_existence(dest_dir, name)) {
+		printf(EXIST);
+		return;
+	}
+	
+	// Remove the file from the list of all files in the source directory
+	temp = &(source_dir->file); 
 	item = source_dir->file;
 	while (item != NULL) {
 		if (strcmp(name, item->item_name) == 0) {
 			(*temp) = item->next;
-			update_directory(source_dir->current->inode, item, 0);
+			update_directory(source_dir, item, 0);
 			update_sizes(source_dir, -(inodes[item->inode].file_size));
 			break;
 		}
@@ -490,30 +475,31 @@ void mv(char *files) {
 		return;
 	}
 	
-	dest_dir = find_directory(dest);
-	if (!dest_dir) {
-		printf(PNF);
-		return;
-	}
-	
+
+	// Get the last (free) item in the list of all files in the destination directory
 	pitem2 = &(dest_dir->file);
 	while (*pitem2 != NULL) {
 		pitem2 = &((*pitem2)->next);
 	}
-	*pitem2 = item;
-	update_directory(dest_dir->current->inode, item, 1);
+	
+	*pitem2 = item;	// Add file to the destination directory
+	
+	update_directory(dest_dir, item, 1);
 	update_sizes(dest_dir, inodes[item->inode].file_size);
 	
 	printf(OK);
 }
 
 
-void rm(char *path) {
-	int i, block_count, rest, tmp;
+/*	Remove file
+
+	param file ... removing file (+path)
+*/
+void rm(char *file) {
+	int i, block_count, rest, tmp, prev;
 	int32_t *blocks;
-	inode node;
-	directory *dir;
 	char *name;
+	directory *dir;
 	directory_item *item, **temp;
 	
 	if (!fs_formatted) {
@@ -521,16 +507,22 @@ void rm(char *path) {
 		return;	
 	}
 	
-	if (parse_path(path, &name, &dir)) {
+	if (!file || file == "") {
+		printf(FNF);
+		return;
+	}
+	
+	// Parse the path + find the directory
+	if (parse_path(file, &name, &dir)) {
 		printf(FNF);
 		return;
 	}
 
+	// Remove the file from the list of all files in the directory
 	temp = &(dir->file);
 	item = dir->file;
 	while (item != NULL) {
 		if (strcmp(name, item->item_name) == 0) {
-			node = inodes[item->inode];
 			(*temp) = item->next;
 			break;
 		}
@@ -542,54 +534,19 @@ void rm(char *path) {
 		printf(FNF);
 		return;
 	}
-	
-	update_directory(dir->current->inode, item, 0);
-	free(item);
-	
-	block_count = node.file_size / CLUSTER_SIZE;
-	rest = node.file_size % CLUSTER_SIZE;
-	if (rest != 0)
-		block_count++;
-		
-	blocks = (int32_t *)malloc(block_count);
-	blocks[0] = node.direct1;
-	if (block_count > 1) {
-		blocks[1] = node.direct2;
-		if (block_count > 2) {
-			blocks[2] = node.direct3;
-			if (block_count > 3) {
-				blocks[3] = node.direct4;
-				if (block_count > 4) {
-					blocks[4] = node.direct5;
-					if (block_count > 5) {
-						if (block_count > 261) {
-							fseek(fs, sb->data_start_address + node.indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fread(&blocks[5], sizeof(int32_t), 256, fs);
-							
-							tmp = block_count - 261;
-							fseek(fs, sb->data_start_address + node.indirect2 * CLUSTER_SIZE, SEEK_SET);
-							fread(&blocks[261], sizeof(int32_t), tmp, fs);
-						}
-						else {
-							tmp = block_count - 5;
-							fseek(fs, sb->data_start_address + node.indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fread(&blocks[5], sizeof(int32_t), tmp, fs);
-						}
-					}
-				}
-			}
-		}
-	}
-	
-	for (i = 0; i < block_count; i++) {
-		bitmap[blocks[i]] = 0;
-	}
-	update_bitmap(node.nodeid, 0);
-	
+
+	// Get numbers of data blocks of the file
+	blocks = get_data_blocks(item->inode, &block_count, &rest);
+
+	// Clear data blocks
 	memset(block_buffer, 0, CLUSTER_SIZE);
+	prev = blocks[0];
 	for (i = 0; i < block_count - 1; i++) {
-		fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
+		if (prev != blocks[i] - 1) {
+			fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
+		}
 		fwrite(block_buffer, sizeof(block_buffer), 1, fs);
+		prev = blocks[i];
 	}
 	
 	if (rest != 0)
@@ -599,58 +556,64 @@ void rm(char *path) {
 	
 	fseek(fs, sb->data_start_address + blocks[block_count - 1] * CLUSTER_SIZE, SEEK_SET);
 	fwrite(block_buffer, tmp, 1, fs);
-	fflush(fs);
-	free(blocks);
 	
-	update_sizes(dir, -(node.file_size));
+	if (inodes[item->inode].indirect1 != FREE) {
+		fseek(fs, sb->data_start_address + inodes[item->inode].indirect1 * CLUSTER_SIZE, SEEK_SET);
+		fwrite(block_buffer, sizeof(block_buffer), 1, fs);
+		
+		if (inodes[item->inode].indirect2 != FREE) {
+			fseek(fs, sb->data_start_address + inodes[item->inode].indirect2 * CLUSTER_SIZE, SEEK_SET);
+			fwrite(block_buffer, sizeof(block_buffer), 1, fs);
+		}
+	}
+	
+	fflush(fs);
 
-	clear_inode(node.nodeid);
-	update_inode(node.nodeid);
+	update_bitmap(item, 0, blocks, block_count);
+	update_sizes(dir, -(inodes[item->inode].file_size));
+	update_directory(dir, item, 0);
+	
+	clear_inode(item->inode);
+	update_inode(item->inode);
+	
+	free(item);
+	free(blocks);
 	
 	printf(OK);
 }
 
 
-/*	***************************************************
-	Create a new directory
+/*	Create a new directory
 	
-	param path ... path of the new directory
+	param path ... name of the new directory (+path)
 */
 void mymkdir(char *path) {
-	directory *dir;			// Parent of adding directory
-	directory_item *item;
-	char *name;				// Name of the creating directory
+	directory *dir;
+	char *name;			
 	
-	if (!fs_formatted) {	// Filesystem was not formatted yet
+	if (!fs_formatted) {
 		print_format_msg();
 		return;	
 	}
 	
+	if (!path || path == "") {
+		printf(PNF);
+		return;
+	}
+	
+	// Parse the path + find the parent directory
 	if (parse_path(path, &name, &dir)) {
 		printf(PNF);
 		return;
 	}
 
-	// If the file with the same name already exist 
-	item = dir->file;
-	while (item != NULL) {
-		if (strcmp(name, item->item_name) == 0) {
-			printf(EXIST);
-			return;
-		}
-		item = item->next;
+	// Test if destination folder doesn't contain file/directory with the same name
+	if (test_existence(dir, name)) {
+		printf(EXIST);
+		return;
 	}
-	
-	// If the directory with the same name already exist
-	item = dir->subdir;
-	while (item != NULL) {
-		if (strcmp(name, item->item_name) == 0) {	
-			printf(EXIST);
-			return;
-		}
-		item = item->next;
-	}
-	
+
+	// Create directory
 	if (create_directory(dir, name)) {
 		printf(NES);
 		return;
@@ -659,10 +622,9 @@ void mymkdir(char *path) {
 }
 
 
-/* 	***************************************************
-	Remove the empty directory
+/* 	Remove the empty directory
 
-	param path ... path to the removing directory
+	param path ... name of the removing directory (+path)
 */
 void myrmdir(char *path) {
 	directory *dir;
@@ -674,13 +636,19 @@ void myrmdir(char *path) {
 		return;	
 	}
 	
+	if (!path || path == "") {
+		printf(PNF);
+		return;
+	}
+	
+	// Parse the path + find the parent directory
 	if (parse_path(path, &name, &dir)) {
 		printf(PNF);
 		return;
 	}
 
-	temp = &(dir->subdir); // Previous item 
-	item = dir->subdir;	   // Current item
+	temp = &(dir->subdir); 
+	item = dir->subdir;
 	while (item != NULL) {
 		if (strcmp(name, item->item_name) == 0) {
 			if ((directories[item->inode]->file != NULL) || (directories[item->inode]->subdir != NULL)) {		// If directory is not empty
@@ -690,27 +658,27 @@ void myrmdir(char *path) {
 
 			(*temp) = item->next;
 			
-			if (working_directory == directories[item->inode]) {	// If removing working directory
+			if (working_directory == directories[item->inode]) {	// If removing working directory -> get to one level up in hierarchy
 				working_directory = directories[item->inode]->parent;
 			}
 			
-			bitmap[inodes[item->inode].direct1] = 0;
-			update_bitmap(item->inode, 0);
+			update_bitmap(item, 0, NULL, 0);
 			
-			clear_inode(item->inode);		// Set i-node as free
+			clear_inode(item->inode);
 			update_inode(item->inode);
-			
-			update_directory(dir->current->inode, item, 0);
-		
-			free(directories[item->inode]->current);	// Clear directory
+
+			update_directory(dir, item, 0);
+
 			free(directories[item->inode]);
 			free(item);
+
 			break;
 		}
 		temp = &(item->next);
 		item = item->next;
 	}
-	if (!item) {	// If file was found
+	
+	if (!item) {	// If directory wasn't found
 		printf(FNF);
 		return;
 	}
@@ -719,13 +687,11 @@ void myrmdir(char *path) {
 }
 
 
-/*	***************************************************
-	Print all items in the directory
+/*	Print all items in the directory
 
 	param path ... path of the directory
 */
 void ls(char *path) {
-	int i;
 	directory *dir;
 	directory_item *item;
 	
@@ -739,6 +705,7 @@ void ls(char *path) {
 		return;
 	}
 	
+	// Find the directory
 	dir = find_directory(path);
 	if (!dir) {
 		printf(PNF);
@@ -759,7 +726,11 @@ void ls(char *path) {
 }
 
 
-void cat(char *path) {
+/*	Print content of the file
+
+	param file ... name of file (+path)
+*/
+void cat(char *file) {
 	directory *dir;
 	directory_item *item;
 	char *name;
@@ -769,26 +740,28 @@ void cat(char *path) {
 		return;	
 	}
 	
-	if (parse_path(path, &name, &dir)) {
+	if (!file || file == "") {
 		printf(FNF);
 		return;
 	}
 	
-	item = dir->file;
-	while (item != NULL) {
-		if (strcmp(name, item->item_name) == 0) {
-			print_file(item->inode);
-			printf("\n");
-			return;
-		}
-		item = item->next;
+	// Parse the path + file + find the directory
+	if (parse_path(file, &name, &dir)) {
+		printf(FNF);
+		return;
 	}
-	printf(FNF);
+	
+	item = find_item(dir->file, name);
+	if (!item) {
+		printf(FNF);
+		return;
+	}
+	print_file(item);
+	printf("\n");
 }
 
 
-/*	***************************************************
-	Change the working directory according to the path
+/*	Change the working directory according to the path
 
 	param path ... path to the new working directory
 */
@@ -800,9 +773,15 @@ void cd(char *path) {
 		return;	
 	}
 	
+	if (!path || path == "") {
+		printf(PNF);
+		return;
+	}
+	
+	// Find the directory
 	dir = find_directory(path);
 	if (!dir) {		
-		printf(PNF);	// Path not found
+		printf(PNF);
 		return;
 	}
 	
@@ -811,11 +790,9 @@ void cd(char *path) {
 }
 
 
-/*	***************************************************
-	Print the path of the working directory
-*/
+/*	Print the path of the working directory */
 void pwd() {
-	char *names[32];	// Directory names on the path to the working directory
+	char *names[64];	// Directory names on the path to the working directory
 	int count = 0;
 	int i;
 	directory *temp = working_directory;
@@ -841,6 +818,10 @@ void pwd() {
 }
 
 
+/*	Print the info about the file/directory
+
+	param path ... file/directory name (+path)
+*/
 void info(char *path) {
 	directory *dir;
 	char *name;
@@ -851,36 +832,47 @@ void info(char *path) {
 		return;	
 	}
 	
+	if (!path || path == "") {
+		printf(FNF);
+		return;
+	}
+	
+	// Parse the path + file + find the directory
 	if (parse_path(path, &name, &dir)) {
 		printf(FNF);
 		return;
 	}
 	
+	// If directory is root
+	if (dir == directories[0] && strlen(name) == 0) {
+		print_info(dir->current);
+		return;
+	}
+	
 	// Finding item between files 
-	item = dir->file;
-	while (item != NULL) {
-		if (strcmp(name, item->item_name) == 0) {
-			print_info(item);	
-			return;
-		}
-		item = item->next;
+	if (item = find_item(dir->file, name)) {
+		print_info(item);
+		return;
+		
 	}
 	
 	// Finding item between subdirectories
-	item = dir->subdir;
-	while (item != NULL) {
-		if (strcmp(name, item->item_name) == 0) {	
-			print_info(item);
-			return;
-		}
-		item = item->next;
+	if (item = find_item(dir->subdir, name)) {
+		print_info(item);
+		return;
 	}
+	
+	printf(FNF);
 }
 
 
+/*	Copy file from the extern filesystem into this filesystem
+
+	param files ... source file (+path) and destination directory (+path)
+*/
 void incp(char *files) {
 	int32_t file_size, *blocks, inode_id;
-	int block_count, rest, tmp, tmp2, i, last_block;
+	int i, block_count, rest, tmp_count, tmp, last_block_index, prev;
 	char *source, *dest, *name;
 	directory *dir; 
 	directory_item **pitem;
@@ -891,9 +883,18 @@ void incp(char *files) {
 		return;	
 	}
 	
-	source = strtok(files, " ");
-	dest = strtok(NULL, "\n");
+	if (!files || files == "") { // No arguments
+		printf(FNF);
+		return;
+	}
+	source = strtok(files, " ");	// Get source
+	dest = strtok(NULL, "\n");		// Get destination
+	if (!dest || dest == "") {
+		printf(PNF);
+		return;
+	}
 	
+	// Get name of the source file
 	if ((name = strrchr(source, '/')) == NULL) {
 		name = source;
 	}
@@ -901,21 +902,27 @@ void incp(char *files) {
 		name++;
 	}
 	
-	if ((f = fopen(source, "rb")) == NULL) {
-		printf(FNF);		// Source was not found
+	if (!(f = fopen(source, "rb"))) {
+		printf(FNF);
 		return;
 	}
 	
+	// Find destination directory
 	dir = find_directory(dest);
 	if (!dir) {
-		printf(PNF);		// Destination was not found
+		printf(PNF);
 		return;
 	}
 	
+	// Get size of the copied file
 	fseek(f, 0, SEEK_END);
 	file_size = ftell(f);
 	rewind(f);
 	
+	if (file_size > MAX_SIZE) {
+		printf(TL);
+		return;
+	}
 	
 	block_count = file_size / CLUSTER_SIZE;
 	rest = file_size % CLUSTER_SIZE;
@@ -924,18 +931,19 @@ void incp(char *files) {
 		block_count++;
 	
 	if (block_count < 5)	// Use only direct references
-		tmp = block_count;
+		tmp_count = block_count;
 	else if ((block_count > 5) && (block_count < 262))	// Use first indirect reference (+1 data block)
-		tmp = block_count + 1;
+		tmp_count = block_count + 1;
 	else 
-		tmp = block_count + 2;			// Use both indirect references (+2 data block)
+		tmp_count = block_count + 2;			// Use both indirect references (+2 data block)
 	
-	blocks = find_free_data_blocks(tmp);
+	blocks = find_free_data_blocks(tmp_count);
 	if (!blocks) {
 		printf(NES);
 		return;
 	}
 	
+	// Get ID of a free i-node
 	inode_id = find_free_inode();
 	if (inode_id == ERROR) {
 		printf(NES);
@@ -948,62 +956,23 @@ void incp(char *files) {
 	}
 	*pitem = create_directory_item(inode_id, name);
 
-	inodes[inode_id].nodeid = inode_id;
-	inodes[inode_id].isDirectory = 0;
-	inodes[inode_id].references = 1;
-	inodes[inode_id].file_size = file_size;
-	inodes[inode_id].direct1 = blocks[0];
-	last_block = 0;
-	if (block_count > 1) {
-		inodes[inode_id].direct2 = blocks[1];
-		last_block = 1;
-		if (block_count > 2) {
-			inodes[inode_id].direct3 = blocks[2];
-			last_block = 2;
-			if (block_count > 3) {
-				inodes[inode_id].direct4 = blocks[3];
-				last_block = 3;
-				if (block_count > 4) {
-					inodes[inode_id].direct5 = blocks[4];
-					last_block = 4;
-					if (block_count > 5) {
-						inodes[inode_id].indirect1 = blocks[tmp - 1];
-						last_block = tmp - 2;
-						
-						if (block_count > 261) {
-							inodes[inode_id].indirect2 = blocks[tmp - 2];
-							last_block = tmp - 3;
-							fseek(fs, sb->data_start_address + inodes[inode_id].indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fwrite(&blocks[5], sizeof(int32_t), 256, fs);
-							
-							tmp2 = block_count - 261;
-							fseek(fs, sb->data_start_address + inodes[inode_id].indirect2 * CLUSTER_SIZE, SEEK_SET);
-							fwrite(&blocks[261], sizeof(int32_t), tmp2, fs);
-						}
-						else  {
-							tmp2 = block_count - 5;
-							fseek(fs, sb->data_start_address + inodes[inode_id].indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fwrite(&blocks[5], sizeof(int32_t), tmp2, fs);
-						}
-					}
-				}
-			}
-		}
-	}
-	
-	for (i = 0; i < tmp; i++) {
-		bitmap[blocks[i]] = 1;
-	}
-	
-	update_bitmap(inode_id, 1);
+	// Initialize i-node
+	initialize_inode(inode_id, file_size, block_count, tmp_count, &last_block_index, blocks);
+
+	update_bitmap(*pitem, 1, blocks, block_count);
 	update_inode(inode_id);
-	update_directory(dir->current->inode, *pitem, 1);
+	update_directory(dir, *pitem, 1);
 	update_sizes(dir, file_size);
+
 	
+	prev = blocks[0];
 	for (i = 0; i < block_count - 1; i++) {
 		fread(block_buffer, sizeof(block_buffer), 1, f);
-		fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
+		if (prev != blocks[i] - 1) {
+			fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
+		}
 		fwrite(block_buffer, sizeof(block_buffer), 1, fs);
+		prev = blocks[i];
 	}
 	
 	memset(block_buffer, 0, CLUSTER_SIZE);
@@ -1013,20 +982,24 @@ void incp(char *files) {
 		tmp = CLUSTER_SIZE;
 	
 	fread(block_buffer, sizeof(char), tmp, f);
-	fseek(fs, sb->data_start_address + blocks[last_block] * CLUSTER_SIZE, SEEK_SET);
+	fseek(fs, sb->data_start_address + blocks[last_block_index] * CLUSTER_SIZE, SEEK_SET);
 	fwrite(block_buffer, sizeof(char), tmp, fs);
 	fflush(fs);
 	
 	fclose(f);
 	free(blocks);
+
 	printf(OK);
 }
 
 
+/*	Copy file from this filesystem to extern filesystem
+
+	param files ... source file (+path) and destination directory (+path)
+*/
 void outcp(char *files) {
-	int i, block_count, rest, found = 0, tmp;
+	int i, block_count, rest, tmp, prev;
 	int32_t *blocks;
-	inode node;
 	char *source, *dest, *name;
 	char whole_dest[BUFF_SIZE];
 	directory *dir;
@@ -1038,79 +1011,51 @@ void outcp(char *files) {
 		return;	
 	}
 	
-	source = strtok(files, " ");
-	dest = strtok(NULL, "\n");
-	
+	if (!files || files == "") { // No arguments
+		printf(FNF);
+		return;
+	}
+	source = strtok(files, " ");	// Get source
+	dest = strtok(NULL, "\n");		// Get destination
+	if (!dest || dest == "") {
+		printf(PNF);
+		return;
+	}
+	// Parse the path + file + find the directory
 	if (parse_path(source, &name, &dir)) {
 		printf(FNF);
 		return;
 	}
-
+	
+	// Set a whole destination (path + name)
 	memset(whole_dest, 0, BUFF_SIZE);
 	sprintf(whole_dest, "%s/%s", dest, name);
 	
-	
-	if ((f = fopen(whole_dest, "wb")) == NULL) {
-		printf(PNF);		// Source was not found
+	if (!(f = fopen(whole_dest, "wb"))) {
+		printf(PNF);
 		return;
 	}
 	
-	item = dir->file;
-	while (item != NULL) {
-		if (strcmp(name, item->item_name) == 0) {
-			node = inodes[item->inode];
-			found = 1;
-			break;
-		}
-		item = item->next;
-	}
+	item = find_item(dir->file, name);
 	
-	if (!found) {
+	if (!item) {
 		printf(FNF);
 		return;
 	}
 	
-	block_count = node.file_size / CLUSTER_SIZE;
-	rest = node.file_size % CLUSTER_SIZE;
-	if (rest != 0)
-		block_count++;
-		
-	blocks = (int32_t *)malloc(block_count);
-	blocks[0] = node.direct1;
-	if (block_count > 1) {
-		blocks[1] = node.direct2;
-		if (block_count > 2) {
-			blocks[2] = node.direct3;
-			if (block_count > 3) {
-				blocks[3] = node.direct4;
-				if (block_count > 4) {
-					blocks[4] = node.direct5;
-					if (block_count > 5) {
-						if (block_count > 261) {
-							fseek(fs, sb->data_start_address + node.indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fread(&blocks[5], sizeof(int32_t), 256, fs);
-							
-							tmp = block_count - 261;
-							fseek(fs, sb->data_start_address + node.indirect2 * CLUSTER_SIZE, SEEK_SET);
-							fread(&blocks[261], sizeof(int32_t), tmp, fs);
-						}
-						else {
-							tmp = block_count - 5;
-							fseek(fs, sb->data_start_address + node.indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fread(&blocks[5], sizeof(int32_t), tmp, fs);
-						}
-					}
-				}
-			}
-		}
-	}
-	
+	blocks = get_data_blocks(item->inode, &block_count, &rest);
+
+	prev = blocks[0];
 	for (i = 0; i < block_count - 1; i++) {
-		fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
+		if (prev != (blocks[i] - 1)) {	// If data blocks are not in sequence
+			fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
+		}
 		fread(block_buffer, sizeof(block_buffer), 1, fs);
 		fwrite(block_buffer, sizeof(block_buffer), 1, f);
+		fflush(f);
+		prev = blocks[i];
 	}
-	
+
 	memset(block_buffer, 0, CLUSTER_SIZE);
 	if (rest != 0)
 		tmp = rest;
@@ -1129,6 +1074,11 @@ void outcp(char *files) {
 }
 
 
+/*	Load a file with commands to perform
+
+	param file ... name of the file with commands (+path)
+	return open file
+*/
 FILE *load(char *file) {
 	FILE *f;
 	
@@ -1138,24 +1088,27 @@ FILE *load(char *file) {
 	}
 
 	if ((f = fopen(file, "r")) == NULL) {
-		printf(FNF);		// Source was not found
+		printf(FNF);
 		return NULL;
 	}
-	file_input = 1;
+	file_input = 1;	// Set the indicator that commands are loaded from the file
 	
 	printf(OK);
 	return f;
 }
 
 
-/* 	***************************************************
-	Format existing filesystem or create a new one with specific size
+/* 	Format existing filesystem or create a new one with a specific size
 
 	param bytes ... size of the filesystem in bytes
 */
 void format(long bytes) {
-	int i;
+	int i, one = 1;
 	directory *root;
+	
+	if (!fs) {
+		fs = fopen(fs_name, "wb+");
+	}
 	
 	printf("Formating...\n");
 	
@@ -1260,8 +1213,9 @@ void format(long bytes) {
 	fwrite(&(sb->inode_start_address), sizeof(int32_t), 1, fs);
 	fwrite(&(sb->data_start_address), sizeof(int32_t), 1, fs);
 	
-	// Store bitmap
-	update_bitmap(0, 1);
+	// Store bitmap - data block 0 (root)
+	fseek(fs, sb->bitmap_start_address, SEEK_SET);
+	fwrite(&one, sizeof(int8_t), 1, fs);
 	
 	// Store i-nodes
 	for (i = 0; i < sb->inode_count; i++) {
@@ -1273,15 +1227,272 @@ void format(long bytes) {
 }
 
 
-void defrag(char *cmd) {
+void defrag() {
+	int32_t i, j, k, l, tmp, rest, count_of_full_blocks = 0;
+	int32_t *blocks, *blocks2;
+	short unsorted_inodes[sb->inode_count];	// bitmap of i-nodes which are unsorted		1 = unsorted,	0 = sorted
+	short changed_inodes[sb->inode_count];	// bitmap of i-nodes which were modified	1 = changed, 0 = unchanged
+	int inode_block_count[sb->inode_count];	// count of data blocks for every i-node
+	int32_t **data_blocks;		// array of data blocks for every i-node
+	data_info **info_blocks;
+	
+	
 	if (!fs_formatted) {
 		print_format_msg();
 		return;	
 	}
+
+	// Prepare data for defragmentation
+	info_blocks = map_data_blocks(&count_of_full_blocks);
+	data_blocks = (int32_t **)malloc(sizeof(int32_t *) * sb->inode_count);
+
+	for (i = 0; i < sb->inode_count; i++) {
+		data_blocks[i] = NULL;
+	}
+	for (i = 0; i < sb->inode_count; i++) {
+		if (inodes[i].nodeid == FREE) {
+			continue;
+		}
+
+		data_blocks[i] = get_data_blocks(i, &(inode_block_count[i]), &rest);
+		
+		tmp = 0;
+		if (inodes[i].indirect1 != FREE) 
+			tmp++;
+		if (inodes[i].indirect2 != FREE)
+			tmp++;
+			
+		if (tmp != 0) {
+			data_blocks[i] = (int32_t *)realloc(data_blocks[i], sizeof(int32_t) * inode_block_count[i] + tmp);
+			if (tmp == 1) {
+				data_blocks[i][inode_block_count[i]] = inodes[i].indirect1;
+			}
+			else {
+				data_blocks[i][inode_block_count[i]] = inodes[i].indirect2;
+				data_blocks[i][inode_block_count[i] + 1] = inodes[i].indirect1;
+			}
+			inode_block_count[i] += tmp;
+		}
+
+		// test if data blocks are sorted
+		for (j = 1; j < inode_block_count[i]; j++) {
+			if (data_blocks[i][j - 1] != (data_blocks[i][j] - 1)) {
+				unsorted_inodes[i] = 1;
+				break;	
+			}
+		}
+	}
+
+	// Rearrange data blocks so that free blocks were after full blocks
+	for (i = 0; i < count_of_full_blocks; i++) {
+		if (info_blocks[i] != NULL) 
+			continue;
+		
+		j = i + 1;
+		// Find the next nearest full data block
+		while (info_blocks[j] == NULL) {
+			j++;
+		}
+		changed_inodes[info_blocks[j]->nodeid] = 1;
+		switch_blocks(j, i, info_blocks);
+	}
+
+	// Rearrange data blocks so that blocks of one i-node were consecutive
+	i = 0;
+	while (i < count_of_full_blocks) {
+		
+		if (!(unsorted_inodes[info_blocks[i]->nodeid])) {
+			i += inode_block_count[info_blocks[i]->nodeid];
+			continue;
+		}
+
+		blocks = data_blocks[info_blocks[i]->nodeid];
+
+		for (j = i, k = 0; j < (i + inode_block_count[info_blocks[i]->nodeid]); j++, k++) {
+			if (j == blocks[k]) {
+				continue;
+			}
+			
+			switch_blocks(blocks[k], j, info_blocks);
+			tmp = blocks[k];
+			blocks[k] = j;
+			
+			blocks2 = data_blocks[info_blocks[j]->nodeid];
+			for (l = 0; l < inode_block_count[info_blocks[i]->nodeid]; l++) {
+				if (j == blocks2[l]) {
+					blocks2[l] = tmp;
+					break;
+				}
+			}
+		}
+		i += inode_block_count[info_blocks[i]->nodeid];
+	}
+	
+	// Save bitmap
+	fseek(fs, sb->bitmap_start_address, SEEK_SET);
+	fwrite(bitmap, sizeof(int8_t), sb->data_cluster_count, fs);
+	
+	// Save changed i-nodes
+	for (i = 0; i < sb->inode_count; i++) {
+		if (changed_inodes[i] == 1) {
+			update_inode(i);
+		}
+	}
+	
+	// Free data blocks
+	for (i = 0; i < sb->inode_count; i++) {
+		if (data_blocks[i] == NULL)
+			continue;
+		
+		free(data_blocks[i]);
+	}
+	free(data_blocks);
+	
+	// Free data_info blocks
+	for (i = 0; i < sb->data_cluster_count; i++) {
+		if (info_blocks[i] == NULL)
+			continue;
+			
+		free(info_blocks[i]);
+	}
+	free(info_blocks);
 }
 
 
 /* 	**************************************************************************************	*/
+
+data_info *create_data_info(int32_t nodeid, int32_t *ref_addr, long addr_in_indirect) {
+	data_info *block = (data_info *)malloc(sizeof(data_info));
+	block->nodeid = nodeid;
+	block->ref_addr = ref_addr;
+	block->addr_in_indirect = addr_in_indirect;
+}
+
+data_info **map_data_blocks(int *count_of_full_blocks) {
+	int i, j;
+	int32_t number;
+	long addr_in_indir;
+	data_info **blocks = (data_info **)malloc(sizeof(data_info *) * sb->data_cluster_count);
+	for (i = 0; i < sb->data_cluster_count; i++) {
+		blocks[i] = NULL;
+	}
+	
+	for (i = 0; i < sb->inode_count; i++) {
+		if (inodes[i].nodeid == FREE)
+			continue;
+			
+		if (inodes[i].direct1 != FREE) {
+			blocks[inodes[i].direct1] = create_data_info(inodes[i].nodeid, &(inodes[i].direct1), 0);
+			(*count_of_full_blocks)++;
+		}
+		if (inodes[i].direct2 != FREE) {
+			blocks[inodes[i].direct2] = create_data_info(inodes[i].nodeid, &(inodes[i].direct2), 0);
+			(*count_of_full_blocks)++;
+		}
+		if (inodes[i].direct3 != FREE) {
+			blocks[inodes[i].direct3] = create_data_info(inodes[i].nodeid, &(inodes[i].direct3), 0);
+			(*count_of_full_blocks)++;
+		}
+		if (inodes[i].direct4 != FREE) {
+			blocks[inodes[i].direct4] = create_data_info(inodes[i].nodeid, &(inodes[i].direct4), 0);
+			(*count_of_full_blocks)++;
+		}
+		if (inodes[i].direct5 != FREE) {
+			blocks[inodes[i].direct5] = create_data_info(inodes[i].nodeid, &(inodes[i].direct5), 0);
+			(*count_of_full_blocks)++;
+		}
+		if (inodes[i].indirect1 != FREE) {
+			blocks[inodes[i].indirect1] = create_data_info(inodes[i].nodeid, &(inodes[i].indirect1), 0);
+			(*count_of_full_blocks)++;
+			fseek(fs, sb->data_start_address + inodes[i].indirect1 * CLUSTER_SIZE, SEEK_SET);
+			for (j = 0; j < 256; j++) {
+				fread(&number, sizeof(int32_t), 1, fs);
+				if (number > 0) {
+					addr_in_indir = ftell(fs) - 4;
+					blocks[number] = create_data_info(inodes[i].nodeid, NULL, addr_in_indir);
+					(*count_of_full_blocks)++;
+				}
+			}
+		}
+		if (inodes[i].indirect2 != FREE) {
+			blocks[inodes[i].indirect2] = create_data_info(inodes[i].nodeid, &(inodes[i].indirect2), 0);
+			(*count_of_full_blocks)++;
+			fseek(fs, sb->data_start_address + inodes[i].indirect2 * CLUSTER_SIZE, SEEK_SET);
+			for (j = 0; j < 256; j++) {
+				fread(&number, sizeof(int32_t), 1, fs);
+				if (number > 0) {
+					addr_in_indir = ftell(fs) - 4;
+					blocks[number] = create_data_info(inodes[i].nodeid, NULL, addr_in_indir);
+					(*count_of_full_blocks)++;
+				}
+			}
+		}
+	}
+	
+	fflush(fs);
+	return blocks;
+}
+
+
+
+void switch_blocks(int from, int to, data_info **info_blocks) {
+	data_info *tmp;
+	char tmp_buffer[CLUSTER_SIZE];
+	
+	// Update source (from) i-node
+	if (info_blocks[from]->ref_addr != NULL) {
+		*(info_blocks[from]->ref_addr) = to; 
+	}
+	else {
+		fseek(fs, info_blocks[from]->addr_in_indirect, SEEK_SET);
+		fwrite(&to, sizeof(int32_t), 1, fs);
+		fflush(fs);
+	}
+	
+	if (info_blocks[to] == NULL) { // Destination data block is free -> one directional move
+		// Update bitmap
+		bitmap[from] = 0;
+		bitmap[to] = 1;
+		
+		memset(tmp_buffer, 0, sizeof(tmp_buffer));
+		
+		info_blocks[to] = info_blocks[from];
+		info_blocks[from] = NULL;
+	}
+	else  {	// Exchange of data blocks
+		
+		// Update destination (to) i-node
+		if (info_blocks[to]->ref_addr != NULL) {
+			*(info_blocks[to]->ref_addr) = from; 
+		}
+		else {
+			fseek(fs, info_blocks[to]->addr_in_indirect, SEEK_SET);
+			fwrite(&from, sizeof(int32_t), 1, fs);
+			fflush(fs);
+		}
+							
+		//Copy: to -> tmp_buffer
+		fseek(fs, sb->data_start_address + to * CLUSTER_SIZE, SEEK_SET);
+		fread(tmp_buffer, sizeof(tmp_buffer), 1, fs);
+		
+		tmp = info_blocks[to];
+		info_blocks[to] = info_blocks[from];
+		info_blocks[from] = tmp;
+	}
+	
+							// Copy blocks
+	// from -> block_buffer
+	fseek(fs, sb->data_start_address + from * CLUSTER_SIZE, SEEK_SET);
+	fread(block_buffer, sizeof(block_buffer), 1, fs);
+	// block_buffer -> to
+	fseek(fs, sb->data_start_address + to * CLUSTER_SIZE, SEEK_SET);
+	fflush(fs);
+	fwrite(block_buffer, sizeof(block_buffer), 1, fs);
+	// tmp_buffer -> from
+	fseek(fs, sb->data_start_address + from * CLUSTER_SIZE, SEEK_SET);
+	fwrite(tmp_buffer, sizeof(tmp_buffer), 1, fs);
+	fflush(fs);
+}
 
 /*	Validate entered size of the filesystem
 	and convert it into bytes
@@ -1290,38 +1501,38 @@ void defrag(char *cmd) {
 	return ... size of the filesystem in bytes
 */
 int32_t get_size(char *size) {
-	char *units = NULL;		// Units
+	char *units = NULL;
 	long number;
 	
 	if (!size || size == "") {
 		printf(CCF);
-		return -1;
+		return ERROR;
 	}
 	
 	number = strtol(size, &units, 0);	// Convert to number
 	
 	if (number == 0 || errno != 0) {
 		printf(CCF);
-		return -1;
+		return ERROR;
 	}
 	
-	if (strncmp("KB", units, 2) == 0) {
-		number = number * 1000;
+	if (strncmp("KB", units, 2) == 0) {			// Kilobytes
+		number *= 1000;
 	}
-	else if (strncmp("MB", units, 2) == 0) {
-		number = number * 1000000;
+	else if (strncmp("MB", units, 2) == 0) {	// Megabytes
+		number *= 1000000;
 	}
-	else if (strncmp("GB", units, 2) == 0) {
-		number = number * 1000000000;
+	else if (strncmp("GB", units, 2) == 0) {	// Gigabytes
+		number *= 1000000000;
 	}
 	
-	if (number < 20480) {	// If the size is enough 
+	if (number < 20480) {			// If the size is not enough large 
 		printf(CCF);
-		return -1;
+		return ERROR;
 	}
 	else if (number > INT_MAX) {	// If the size is too large
 		printf(CCF);
-		return -1;
+		return ERROR;
 	}
 	
 	return (int32_t)number;
@@ -1330,7 +1541,7 @@ int32_t get_size(char *size) {
 
 /*	Find free i-node
 	
-	return ... i-node ID, if 0 = none i-node is free
+	return ... i-node ID or -1 if no i-node is free
 */
 int32_t find_free_inode() {
 	int i;
@@ -1344,24 +1555,169 @@ int32_t find_free_inode() {
 }
 
 
-/* 	Find free data block in bitmap	*/
+/* 	Find free data blocks in bitmap	
+
+	param count ... count of data blocks
+	return array of free data blocks or NULL if not enough blocks found
+*/
 int32_t *find_free_data_blocks(int count) {
-	int i, c = 0;
+	int i, j = 0;
 	int32_t *blocks = (int32_t *)malloc(sizeof(int32_t) * count);
-		
+	
+	// Try to find consecutive blocks
 	for (i = 1; i < sb->data_cluster_count; i++) {
 		if (bitmap[i] == 0) {
-			blocks[c] = i;
-			c++;
-			if (c == count)
+			if ((j != 0) && (blocks[j - 1] != (i - 1))) {
+				j = 0;
+				continue;
+			}
+			blocks[j] = i;
+			j++;
+			if (j == count) {
+				return blocks;
+			}
+		}
+	}
+	
+	j = 0;
+	// If blocks are not consecutive
+	for (i = 1; i < sb->data_cluster_count; i++) {
+		if (bitmap[i] == 0) {
+			blocks[j] = i;
+			j++;
+			if (j == count)
 				return blocks;
 		}
 	}
 	free(blocks);
-	return NULL;	// Nezapomenout uvolnit pamet pro blocks
+	return NULL;
 }
 
 
+/*	Get numbers of all data blocks of the particular item
+
+	param item ... item from which we get data blocks
+	param block_count ... address to store count of data blocks
+	param rest ... address to store rest size of the last data block (only with file)
+	return array of numbers of data blocks
+*/
+int32_t *get_data_blocks(int32_t nodeid, int *block_count, int *rest) {
+	int32_t *blocks, number;
+	int i, tmp, counter;
+	int max_numbers = 517;	// Maximum data blocks 
+	int max_numbers_in_block = 256;
+	inode *node = &inodes[nodeid];
+	
+	if (node->isDirectory) {	// If item is directory
+		counter = 0;
+		blocks = (int32_t *)malloc(sizeof(int32_t) * max_numbers);
+		
+		if (node->direct1 != FREE) {
+			blocks[counter++] = node->direct1;
+		}
+		if (node->direct2 != FREE) {
+			blocks[counter++] = node->direct2;
+		}
+		if (node->direct3 != FREE) {
+			blocks[counter++] = node->direct3;
+		}	
+		if (node->direct4 != FREE) {
+			blocks[counter++] = node->direct4;
+		}	
+		if (node->direct5 != FREE) {
+			blocks[counter++] = node->direct5;
+		}	
+		if (node->indirect1 != FREE) {
+			fseek(fs, sb->data_start_address + node->indirect1 * CLUSTER_SIZE, SEEK_SET);
+			for (i = 0; i < max_numbers_in_block; i++) {
+				fread(&number, sizeof(int32_t), 1, fs);
+				if (number > 0) {
+					blocks[counter++] = number;
+				}
+			}
+		}
+		if (node->indirect2 != FREE) {
+			fseek(fs, sb->data_start_address + node->indirect2 * CLUSTER_SIZE, SEEK_SET);
+			for (i = 0; i < max_numbers_in_block; i++) {
+				fread(&number, sizeof(int32_t), 1, fs);
+				if (number > 0) {
+					blocks[counter++] = number;
+				}
+			}			
+		}
+		
+		*block_count = counter;
+	}
+	else {	// If item is file
+		*block_count = node->file_size / CLUSTER_SIZE;
+		*rest = node->file_size % CLUSTER_SIZE;
+		if (*rest != 0)
+			(*block_count)++;
+		
+		blocks = (int32_t *)malloc(sizeof(int32_t) * (*block_count));
+		
+		blocks[0] = node->direct1;
+		if (*block_count > 1) {
+			blocks[1] = node->direct2;
+			if (*block_count > 2) {
+				blocks[2] = node->direct3;
+				if (*block_count > 3) {
+					blocks[3] = node->direct4;
+					if (*block_count > 4) {
+						blocks[4] = node->direct5;
+						if (*block_count > 5) {
+							if (*block_count > 261) {	// Both indirect references are used
+								// Read all data blocks of indirect1
+								fseek(fs, sb->data_start_address + node->indirect1 * CLUSTER_SIZE, SEEK_SET);
+								fread(&blocks[5], sizeof(int32_t), max_numbers_in_block, fs);
+								
+								// Read the rest of indirect2
+								tmp = *block_count - 261;
+								fseek(fs, sb->data_start_address + node->indirect2 * CLUSTER_SIZE, SEEK_SET);
+								fread(&blocks[261], sizeof(int32_t), tmp, fs);
+							}
+							else {	// Only first indirect reference is used
+								tmp = *block_count - 5;
+								fseek(fs, sb->data_start_address + node->indirect1 * CLUSTER_SIZE, SEEK_SET);
+								fread(&blocks[5], sizeof(int32_t), tmp, fs);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	fflush(fs);
+	return blocks;
+}
+
+
+/* 	Find particular item with the specific name in a list of items starting with first_item
+
+	param first_item ... first item in the list of items (directories or files)
+	param name ... name of the finding item
+	return founded item or NULL
+*/
+directory_item *find_item(directory_item *first_item, char *name) {
+	directory_item *item = first_item;
+	
+	while (item != NULL) {
+		if (strcmp(name, item->item_name) == 0) {
+			return item;
+		}
+		item = item->next;
+	}
+	return NULL;
+}
+
+
+/*	Parse the path of the file/directory
+
+	param path ... path + name of file/directory
+	param name ... address to store name of the file/directory
+	param name ... address to store founded directory
+	return 0 = directory found, -1 = not found
+*/
 int parse_path(char *path, char **name, directory **dir) {
 	int length;				// Length of the path (without name of the new directory)
 	char buff[BUFF_SIZE];
@@ -1370,15 +1726,15 @@ int parse_path(char *path, char **name, directory **dir) {
 		return ERROR;
 	}
 	
-	if ((*name = strrchr(path, '/')) == NULL) {	// Path contains only directory/file name
+	if ((*name = strrchr(path, '/')) == NULL) {	// If path contains only directory/file name
 		*name = path;
 		*dir = working_directory;
 	}
 	else  {
 		// Separate the name of the directory/file from the rest of the path
 		length = strlen(path) - strlen(*name);
-		if (path[0] == '/') {					// If the path contains only root directory (and name of the creating directory)
-			if (!strchr(path + 1, '/'))
+		if (path[0] == '/') {					
+			if (!strchr(path + 1, '/'))	// If the path contains only root directory (and name of the creating directory)
 				length = 1;
 		}
 		
@@ -1386,7 +1742,8 @@ int parse_path(char *path, char **name, directory **dir) {
 		memset(buff, '\0', BUFF_SIZE);
 		strncpy(buff, path, length);
 		
-		*dir = find_directory(buff);		// Find the directory
+		// Find the directory
+		*dir = find_directory(buff);		
 		if (!(*dir)) {
 			return ERROR;
 		}
@@ -1401,17 +1758,21 @@ int parse_path(char *path, char **name, directory **dir) {
 	
 	param parent ... parent directory
 	param name ... directory name
+	return 0 = no error, -1 = error
 */
 int create_directory(directory *parent, char *name) {
 	int32_t inode_id, *data_block;
 	directory_item **temp;
 
+	// Get ID of a free i-node
 	inode_id = find_free_inode();
 	if (inode_id == ERROR) return ERROR;	// No free i-node
 	
+	// Get number of a free data block
 	data_block = find_free_data_blocks(1);
 	if (data_block == NULL) return ERROR; 	// No free data block
 
+	// Create directory
 	directory *newdir = (directory *)malloc(sizeof(directory));
 	newdir->parent = parent;
 	newdir->current = create_directory_item(inode_id, name);
@@ -1421,6 +1782,7 @@ int create_directory(directory *parent, char *name) {
 	directories[inode_id] = newdir;
 	bitmap[data_block[0]] = 1;
 	
+	// Initialize i-node of a new directory
 	inodes[inode_id].nodeid = inode_id;
 	inodes[inode_id].isDirectory = 1;
 	inodes[inode_id].references = 1;
@@ -1433,19 +1795,20 @@ int create_directory(directory *parent, char *name) {
 	inodes[inode_id].indirect1 = FREE;
 	inodes[inode_id].indirect2 = FREE;
 	
+	
 	temp = &(parent->subdir);
 	while (*temp != NULL) {
 		temp = &((*temp)->next);
 	}
 	
 	*temp = directories[inode_id]->current;
-
-	if (update_directory(parent->current->inode, newdir->current, 1)) {
+	
+	if (update_directory(parent, newdir->current, 1)) {
 		return ERROR;	// No free data block for extending parent data blocks
 	}
+
 	update_inode(inode_id);
-	update_bitmap(inode_id, 1);
-	
+	update_bitmap(newdir->current, 1, data_block, 1);
 	free(data_block);
 	
 	return NO_ERROR;
@@ -1468,6 +1831,36 @@ directory_item *create_directory_item(int32_t inode_id, char *name) {
 	dir_item->next = NULL;
 	
 	return dir_item;
+}
+
+
+/*	Test if directory already contains item with the same name
+
+	param dir ... directory
+	param name ... name of the testing item
+	return 1 = exist, 0 = not exist
+*/
+int test_existence(directory *dir, char *name) {
+	directory_item *item;
+	
+	// If the file with the same name already exist 
+	item = dir->file;
+	while (item != NULL) {
+		if (strcmp(name, item->item_name) == 0) {
+			return 1;
+		}
+		item = item->next;
+	}
+	
+	// If the directory with the same name already exist
+	item = dir->subdir;
+	while (item != NULL) {
+		if (strcmp(name, item->item_name) == 0) {	
+			return 1;
+		}
+		item = item->next;
+	}
+	return 0;
 }
 
 
@@ -1522,9 +1915,7 @@ directory *find_directory(char *path) {
 }
 
 
-/*
-	Free allocated memory for directories
-*/
+/*	Free allocated memory for directories */
 void free_directories(directory *root) {
 	directory_item *f, *d, *t;
 	
@@ -1540,7 +1931,6 @@ void free_directories(directory *root) {
 	while (f != NULL) {
 		t = f->next;
 		free(f);
-		f = NULL;
 		f = t;
 	}
 	
@@ -1551,7 +1941,11 @@ void free_directories(directory *root) {
 	root = NULL;
 }
 
-/* Initialize i-node with specific ID to free */ 
+
+/* Set specific i-node as free 
+
+	param id ... i-node id
+*/ 
 void clear_inode(int id) {
 	inodes[id].nodeid = FREE;
 	inodes[id].isDirectory = 0;
@@ -1567,6 +1961,11 @@ void clear_inode(int id) {
 }
 
 
+/*	Update size of all i-nodes on the path from the directory to root
+
+	param dir ... the directory from which we move up in hierarchy
+	param size ... adding size to originally size (can be negative if remove file)
+*/
 void update_sizes(directory *dir, int32_t size) {
 	directory *d = dir;
 	while (d != directories[0]) {
@@ -1580,93 +1979,77 @@ void update_sizes(directory *dir, int32_t size) {
 }
 
 
+/*	Print info about file/directory
+
+	param item ... file or directory
+*/
 void print_info(directory_item *item) {
 	int i, max_in_block = 256; // Maximum nambers in one data block
 	int32_t number; // Data block number
 	inode node = inodes[item->inode];
 	
-	printf("%s - %dB - i-node %d - %d", item->item_name, node.file_size, node.nodeid, node.direct1);
-	
+	printf("%s - %dB - i-node %d -", item->item_name, node.file_size, node.nodeid);
+	printf(" Dir:");
+	if (node.direct1 != FREE) {
+		printf(" %d", node.direct1);
+	}
 	if (node.direct2 != FREE) {
 		printf(" %d", node.direct2);
-		if (node.direct3 != FREE) {
-			printf(" %d", node.direct3);
-			if (node.direct4 != FREE) {
-				printf(" %d", node.direct4);
-				if (node.direct5 != FREE) {
-					printf(" %d", node.direct5);
-					if (node.indirect1 != FREE) {
-						fseek(fs, sb->data_start_address + node.indirect1 * CLUSTER_SIZE, SEEK_SET);
-						for (i = 0; i < max_in_block; i++) {
-							fread(&number, sizeof(int32_t), 1, fs);
-							if (number == 0) 
-								break;
-							printf(" %d", number);
-						}
-						if (node.indirect2 != FREE) {
-							fseek(fs, sb->data_start_address + node.indirect2 * CLUSTER_SIZE, SEEK_SET);
-							for (i = 0; i < max_in_block; i++) {
-								fread(&number, sizeof(int32_t), 1, fs);
-								if (number == 0) 
-									break;
-								printf(" %d", number);
-							}
-						}
-					}
-				}
-			}
+	}
+	if (node.direct3 != FREE) {
+		printf(" %d", node.direct3);
+	}
+	if (node.direct4 != FREE) {
+		printf(" %d", node.direct4);
+	}
+	if (node.direct5 != FREE) {
+		printf(" %d", node.direct5);
+	}
+	printf(" Indir:");
+	if (node.indirect1 != FREE) {
+		printf(" (%d)", node.indirect1);
+		fseek(fs, sb->data_start_address + node.indirect1 * CLUSTER_SIZE, SEEK_SET);
+		for (i = 0; i < max_in_block; i++) {
+			fread(&number, sizeof(int32_t), 1, fs);
+			if (number == 0) 
+				break;
+			printf(" %d", number);
 		}
 	}
+	if (node.indirect2 != FREE) {
+		printf(" (%d)", node.indirect2);
+		fseek(fs, sb->data_start_address + node.indirect2 * CLUSTER_SIZE, SEEK_SET);
+		for (i = 0; i < max_in_block; i++) {
+			fread(&number, sizeof(int32_t), 1, fs);
+			if (number == 0) 
+				break;
+			printf(" %d", number);
+		}
+	}
+	
 	printf("\n");
 }
 
 
-void print_file(int32_t inode_id) {
-	int block_count, rest, tmp_count, i, tmp;
-	int32_t *blocks;
-	 
-	block_count = inodes[inode_id].file_size / CLUSTER_SIZE;
-	rest = inodes[inode_id].file_size % CLUSTER_SIZE;
-	if (rest != 0)
-		block_count++;
+/* 	Print content of the file
 
-	blocks = (int32_t *)malloc(sizeof(int32_t) * block_count);
-		 
-	blocks[0] = inodes[inode_id].direct1;
-	if (inodes[inode_id].direct2 != FREE) {
-		blocks[1] = inodes[inode_id].direct2;
-		if (inodes[inode_id].direct3 != FREE) {
-			blocks[2] = inodes[inode_id].direct3;
-			if (inodes[inode_id].direct4 != FREE) {
-				blocks[3] = inodes[inode_id].direct4;
-				if (inodes[inode_id].direct5 != FREE) {
-					blocks[4] = inodes[inode_id].direct5;
-					if (inodes[inode_id].indirect1 != FREE) {
-						if (block_count > 261) {
-							tmp_count = 256;
-						}
-						else {
-							tmp_count = block_count - 5;
-						}	
-						
-						fseek(fs, sb->data_start_address + inodes[inode_id].indirect1 * CLUSTER_SIZE, SEEK_SET);
-						fread(&blocks[5], sizeof(int32_t), tmp, fs);
-						
-						if (inodes[inode_id].indirect2 != FREE) {
-							tmp_count = block_count - 261;
-							fseek(fs, sb->data_start_address + inodes[inode_id].indirect2 * CLUSTER_SIZE, SEEK_SET);
-							fread(&blocks[261], sizeof(int32_t), tmp, fs);
-						}
-					}
-				}
-			}
-		}
-	}
-		
+	param item ... printing file
+*/
+void print_file(directory_item *item) {
+	int i, tmp, block_count, rest, prev;
+	int32_t *blocks;
+	
+	// Get data blocks of the file
+	blocks = get_data_blocks(item->inode, &block_count, &rest); 
+
+	prev = blocks[0];
 	for (i = 0; i < block_count - 1; i++) {
-		fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
-		fread(block_buffer, sizeof(char), CLUSTER_SIZE, fs);
-		printf("%s", block_buffer);	
+		if (prev != blocks[i] - 1) {
+			fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
+		}
+		fread(block_buffer, CLUSTER_SIZE, 1, fs);
+		printf("%s", block_buffer);
+		prev = blocks[i];
 	}
 	memset(block_buffer, 0, CLUSTER_SIZE);
 	if (rest != 0)
@@ -1675,11 +2058,10 @@ void print_file(int32_t inode_id) {
 		tmp = CLUSTER_SIZE;
 		
 	fseek(fs, sb->data_start_address + blocks[block_count - 1] * CLUSTER_SIZE, SEEK_SET);
-	fread(block_buffer, sizeof(char), tmp, fs);
-	printf("%s", block_buffer);	
+	fread(block_buffer, tmp, 1, fs);
+	printf("%s", block_buffer);
 	
 	fflush(fs);
-	
 	free(blocks);
 }
 
@@ -1689,12 +2071,79 @@ void print_format_msg() {
 	printf("The filesystem has to be formatted first.\nUsage: format [size]\n");
 }
 
+/*	Set i-node as file and initialize all data blocks
+
+	param id ... i-node ID
+	param size ... size of the file
+	param block_count ... count of data blocks occupied by file
+	param tmp_count ... block_count + blocks for indirect references
+	param last_block_index ... address of the index to the last data block of the file
+	param blocks ... data blocks
+*/
+void initialize_inode(int32_t id, int32_t size, int block_count, int tmp_count, int *last_block_index, int32_t *blocks) {
+	int tmp;
+	inode *node = &inodes[id];
+	
+	node->nodeid = id;
+	node->isDirectory = 0;
+	node->references = 1;
+	node->file_size = size;
+	node->direct1 = blocks[0];
+	
+	*last_block_index = 0;
+	if (block_count > 1) {
+		node->direct2 = blocks[1];
+		*last_block_index = 1;
+		
+		if (block_count > 2) {
+			node->direct3 = blocks[2];
+			*last_block_index = 2;
+			
+			if (block_count > 3) {
+				node->direct4 = blocks[3];
+				*last_block_index = 3;
+				
+				if (block_count > 4) {
+					node->direct5 = blocks[4];
+					*last_block_index = 4;
+					
+					if (block_count > 5) {
+						node->indirect1 = blocks[tmp_count - 1];
+						
+						
+						if (block_count > 261) {
+							node->indirect2 = blocks[tmp_count - 2];
+							*last_block_index = tmp_count - 3;
+							fseek(fs, sb->data_start_address + node->indirect1 * CLUSTER_SIZE, SEEK_SET);
+							fwrite(&blocks[5], sizeof(int32_t), 256, fs);
+							
+							tmp = block_count - 261;
+							fseek(fs, sb->data_start_address + node->indirect2 * CLUSTER_SIZE, SEEK_SET);
+							fwrite(&blocks[261], sizeof(int32_t), tmp, fs);
+						}
+						else  {
+							*last_block_index = tmp_count - 2;
+							tmp = block_count - 5;
+							fseek(fs, sb->data_start_address + node->indirect1 * CLUSTER_SIZE, SEEK_SET);
+							fwrite(&blocks[5], sizeof(int32_t), tmp, fs);
+						}
+					}
+				}
+			}
+		}
+	}
+}
 
 
+/*	Load filesystem from the file */
 void load_fs() {
 	directory *root;
 	int i;
 	
+	if (!fs) {
+		fs = fopen(fs_name, "rb+");
+	}
+
 	// Load superblock
 	sb = (struct superblock *)malloc(sizeof(struct superblock));
 	if (!sb) {
@@ -1763,54 +2212,37 @@ void load_fs() {
 }
 
 
+/*	Load all items of the directory from the file
+
+	param dir ... directory
+	param id ... directory id
+*/
 void load_directory(directory *dir, int id) {
-	int i, j, counter = 0;
+	int i, j, block_count, rest;
 	int inode_count = 64;	// Maximum count of i-nodes in one data block
-	int blocks[5];	// Numbers of data blocks
-	directory_item **psubdir = &(dir->subdir);
-	directory_item **pfile = &(dir->file);
-	directory_item *item, *temp;
+	int32_t *blocks;		// Numbers of data blocks
+	int32_t nodeid;	// Item id
+	char name[12];	// Item name
 	directory *newdir;
+	directory_item *item, *temp;
+	directory_item **psubdir = &(dir->subdir);	// Address of the last (free) subdirectory in the list of subdirectories
+	directory_item **pfile = &(dir->file);		// Address of the last (free) file in the list of files
 	
-	int32_t nodeid;		// Readed id from the file
-	char name[12];		// Readed name from the file
+	// Get data blocks of this directory
+	blocks = get_data_blocks(dir->current->inode, &block_count, NULL);
 	
-	// Store numbers of data blocks to read
-	if (inodes[id].direct1 != FREE) {
-		blocks[0] = inodes[id].direct1;
-		counter++;
-		if (inodes[id].direct2 != FREE) {
-			blocks[0] = inodes[id].direct2;
-			counter++;
-			if (inodes[id].direct3 != FREE) {
-				blocks[0] = inodes[id].direct3;
-				counter++;
-				if (inodes[id].direct4 != FREE) {
-					blocks[0] = inodes[id].direct4;
-					counter++;
-					if (inodes[id].direct5 != FREE) {
-						blocks[0] = inodes[id].direct5;
-						counter++;
-						
-						// + precist datove bloky z neprimych odkazu
-					}
-				}
-			}
-		}
-	}
-	
-	for (i = 0; i < counter; i++) {		// Iteration over data blocks
+	for (i = 0; i < block_count; i++) {		// Iteration over data blocks
 		fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
 		for (j = 0; j < inode_count; j++) {	// Iteration over items in data block
 			fread(&nodeid, sizeof(int32_t), 1, fs);		// Read inode id, if id < 1 -> invalid item and skip to the next item
 			if (nodeid > 0) {
 				fread(name, sizeof(name), 1, fs);
 				item = create_directory_item(nodeid, name);
-				if (inodes[nodeid].isDirectory) {	// If item is directory or file
+				if (inodes[nodeid].isDirectory) {	// If item is directory
 					*psubdir = item;
 					psubdir = &(item->next);
 				}
-				else {
+				else {								// If item is file
 					*pfile = item;
 					pfile = &(item->next);
 				}
@@ -1820,9 +2252,10 @@ void load_directory(directory *dir, int id) {
 			} 
 		}	
 	}
-	
-	temp = dir->subdir;
+	free(blocks);
 
+	// Recursive call this function on all loaded subdirectories
+	temp = dir->subdir;
 	while (temp != NULL) {
 		newdir = (directory *)malloc(sizeof(directory));
 		newdir->parent = dir;
@@ -1838,58 +2271,43 @@ void load_directory(directory *dir, int id) {
 }
 
 
-/*	Update bitmap in the file
+/*	Update bitmap in the file according to the file/directory
 
-	param id ... i-node id
-	param action ... 1 = use data blocks, 0 = free data blocks
+	param item ... file/directory
+	param value ... 1 = use data blocks, 0 = free data blocks
 */
-void update_bitmap(int id, int action) {
-	int8_t one = 1;
-	int8_t zero = 0;
+void update_bitmap(directory_item *item, int8_t value, int32_t *data_blocks, int b_count) {
+	int i, block_count, rest;
+	int32_t *blocks; 
 	
-	
-	if (action == 1) {
-		if (inodes[id].direct1 != FREE) {
-			fseek(fs, sb->bitmap_start_address + inodes[id].direct1, SEEK_SET);
-			fwrite(&one, sizeof(int8_t), 1, fs);
-		}
-		if (inodes[id].direct2 != FREE) {
-			fseek(fs, sb->bitmap_start_address + inodes[id].direct2, SEEK_SET);
-			fwrite(&one, sizeof(int8_t), 1, fs);
-		}
-		if (inodes[id].direct3 != FREE) {
-			fseek(fs, sb->bitmap_start_address + inodes[id].direct3, SEEK_SET);
-			fwrite(&one, sizeof(int8_t), 1, fs);
-		}
-		if (inodes[id].direct4 != FREE) {
-			fseek(fs, sb->bitmap_start_address + inodes[id].direct4, SEEK_SET);
-			fwrite(&one, sizeof(int8_t), 1, fs);
-		}
-		if (inodes[id].direct5 != FREE) {
-			fseek(fs, sb->bitmap_start_address + inodes[id].direct5, SEEK_SET);
-			fwrite(&one, sizeof(int8_t), 1, fs);
-		}
-		
-		// + neprimy odkazy
-		
+	if (!data_blocks) {
+		blocks = get_data_blocks(item->inode, &block_count, NULL);
 	}
 	else {
-		fseek(fs, sb->bitmap_start_address + inodes[id].direct1, SEEK_SET);
-		fwrite(&zero, sizeof(int8_t), 1, fs);
-		fseek(fs, sb->bitmap_start_address + inodes[id].direct2, SEEK_SET);
-		fwrite(&zero, sizeof(int8_t), 1, fs);
-		fseek(fs, sb->bitmap_start_address + inodes[id].direct3, SEEK_SET);
-		fwrite(&zero, sizeof(int8_t), 1, fs);
-		fseek(fs, sb->bitmap_start_address + inodes[id].direct4, SEEK_SET);
-		fwrite(&zero, sizeof(int8_t), 1, fs);
-		fseek(fs, sb->bitmap_start_address + inodes[id].direct5, SEEK_SET);
-		fwrite(&zero, sizeof(int8_t), 1, fs);
-		
-		// + neprimy odkazy
+		blocks = data_blocks;
+		block_count = b_count;
 	}
-	
+	for (i = 0; i < block_count; i++) {
+		bitmap[blocks[i]] = value;
+		fseek(fs, sb->bitmap_start_address + blocks[i], SEEK_SET);
+		fwrite(&value, sizeof(int8_t), 1, fs);
+	}
+
+	// Indirect references blocks
+	if (inodes[item->inode].indirect1 != FREE) {
+		bitmap[inodes[item->inode].indirect1] = value;
+		fseek(fs, sb->bitmap_start_address + inodes[item->inode].indirect1, SEEK_SET);
+		fwrite(&value, sizeof(int8_t), 1, fs);
+	}
+	if (inodes[item->inode].indirect2 != FREE) {
+			bitmap[inodes[item->inode].indirect2] = value;
+			fseek(fs, sb->bitmap_start_address + inodes[item->inode].indirect2, SEEK_SET);
+			fwrite(&value, sizeof(int8_t), 1, fs);
+	}
+
 	fflush(fs);
 }
+
 
 /* 	Update specific i-node in the file
 
@@ -1913,44 +2331,31 @@ void update_inode(int id) {
 	fflush(fs);
 }
 
-int update_directory(int32_t id, directory_item *item, int action) {
-	int i, j, counter = 0;
-	int32_t *data_block;
+
+
+/*	Update directory
+
+	param dir ... directory
+	param item ... item adding/removing to/from the directory
+	param action ... 1 = add item, 0 = remove item
+	return 0 = success, -1 = all data blocks of the directory are full or removing item was not found
+*/
+int update_directory(directory *dir, directory_item *item, int action) {
+	int i, j, block_count, prev, item_count, found = 0;
+	int32_t *blocks, *free_block;
 	int name_length = 12;
 	int zeros[4] = {0};  // buffer with zeros - for removing the item from the file
-	int inode_count = 64;
-	int blocks[5];
-	
+	int max_items_in_block = 64;
 	int32_t nodeid;
+	inode *dir_node;
 	
-	// Store numbers of data blocks
-	if (inodes[id].direct1 != FREE) {
-		blocks[0] = inodes[id].direct1;
-		counter++;
-		if (inodes[id].direct2 != FREE) {
-			blocks[0] = inodes[id].direct2;
-			counter++;
-			if (inodes[id].direct3 != FREE) {
-				blocks[0] = inodes[id].direct3;
-				counter++;
-				if (inodes[id].direct4 != FREE) {
-					blocks[0] = inodes[id].direct4;
-					counter++;
-					if (inodes[id].direct5 != FREE) {
-						blocks[0] = inodes[id].direct5;
-						counter++;
-						
-						// + precist datove bloky z neprimych odkazu
-					}
-				}
-			}
-		}
-	}
+	// Get data blocks
+	blocks = get_data_blocks(dir->current->inode, &block_count, NULL);
 
 	if (action == 1) {	// Store item (find free space)
-		for (i = 0; i < counter; i++) {
+		for (i = 0; i < block_count; i++) {
 			fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
-			for (j = 0; j < inode_count; j++) {
+			for (j = 0; j < max_items_in_block; j++) {
 				fread(&nodeid, sizeof(int32_t), 1, fs);
 				if (nodeid == 0) {	// Free place found -> store item
 					fseek(fs, -4, SEEK_CUR);
@@ -1958,63 +2363,183 @@ int update_directory(int32_t id, directory_item *item, int action) {
 					fwrite(&(item->inode), sizeof(int32_t), 1, fs);
 					fwrite(item->item_name, sizeof(item->item_name), 1, fs);
 					fflush(fs);
+					free(blocks);
 					return NO_ERROR;
 				}
 				else {
-					fseek(fs, name_length, SEEK_CUR);
+					fseek(fs, name_length, SEEK_CUR);	// Skip the space for name
 				}
 			}
 		}
 		
-		data_block = find_free_data_blocks(1);
-		if (data_block == NULL) 
+		// No free space was found in the current data blocks of the directory -> try to find another free data block
+		free_block = find_free_data_blocks(1);	// Use direct reference
+		if (!free_block) 
 			return ERROR;
 		
+		dir_node = &(inodes[dir->current->inode]);
 		
-		if (counter < 5) {	// Next direct reference is free
-			switch(counter) {
-				case 1:	
-					inodes[id].direct2 = data_block[0];
-					break;
-				case 2:	
-					inodes[id].direct3 = data_block[0];
-					break;
-				case 3:	
-					inodes[id].direct4 = data_block[0];
-					break;
-				case 4:	
-					inodes[id].direct5 = data_block[0];
-					break;
-			}
-			fflush(fs);
-			fseek(fs, sb->data_start_address + data_block[0] * CLUSTER_SIZE, SEEK_SET);
-			fwrite(&(item->inode), sizeof(int32_t), 1, fs);
-			fwrite(item->item_name, sizeof(item->item_name), 1, fs);
+		if (dir_node->direct1 == FREE) {
+			dir_node->direct1 = free_block[0];
+		}
+		else if (dir_node->direct2 == FREE) {
+			dir_node->direct2 = free_block[0];
+		}
+		else if (dir_node->direct3 == FREE) {
+			dir_node->direct3 = free_block[0];
+		}
+		else if (dir_node->direct4 == FREE) {
+			dir_node->direct4 = free_block[0];
+		}
+		else if (dir_node->direct5 == FREE) {
+			dir_node->direct5 = free_block[0];
 		}
 		else {
-			// + pouzit neprimy odkazy
-		}
-		free(data_block);
-	}
-	else {	// Remove item (find the item with the specific id)
-		for (i = 0; i < counter; i++) {
-			fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
-			for (j = 0; j < inode_count; j++) {
-				fread(&nodeid, sizeof(int32_t), 1, fs);
-				if (nodeid == (item->inode)) {
-					fseek(fs, -4, SEEK_CUR);
-					fflush(fs);
-					fwrite(&zeros, sizeof(zeros), 1, fs);
-					fflush(fs);
-					return NO_ERROR;
-				}			
+			free(free_block);
+			free_block = find_free_data_blocks(2);	// Use indirect reference (need 2 free blocks)
+			if (!free_block) 
+				return ERROR;
+				
+			if (dir_node->indirect1 == FREE) {
+				dir_node->indirect1 = free_block[1];
+				fseek(fs, sb->data_start_address + free_block[1] * CLUSTER_SIZE, SEEK_SET);
+				fwrite(&(free_block[0]), sizeof(int32_t), 1, fs);
+			}
+			else if (dir_node->indirect2 == FREE) {
+				dir_node->indirect2 = free_block[1];
+				fseek(fs, sb->data_start_address + free_block[1] * CLUSTER_SIZE, SEEK_SET);
+				fwrite(&(free_block[0]), sizeof(int32_t), 1, fs);
 			}
 		}
+		
+
+		fseek(fs, sb->data_start_address + free_block[0] * CLUSTER_SIZE, SEEK_SET);
+		fwrite(&(item->inode), sizeof(int32_t), 1, fs);
+		fwrite(item->item_name, sizeof(item->item_name), 1, fs);
+		
+		fflush(fs);
+		update_bitmap(dir->current, 1, NULL, 0);
+		update_inode(dir->current->inode);
+		free(free_block);
+		free(blocks);
+		return NO_ERROR;
 	}
-	
-	free(data_block);
+	else {	// Remove item (find the item with the specific id)
+		prev = blocks[0];
+		for (i = 0; i < block_count; i++) {
+			if (prev != (blocks[i] - 1)) {
+				fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
+			}
+
+			item_count = 0;
+			for (j = 0; j < max_items_in_block; j++) {
+				fread(&nodeid, sizeof(int32_t), 1, fs);
+				if (nodeid > 0)
+					item_count++;
+					
+				if (!found) {
+					if (nodeid == (item->inode)) {
+						fseek(fs, -4, SEEK_CUR);
+						fflush(fs);
+						fwrite(&zeros, sizeof(zeros), 1, fs);
+						fflush(fs);
+						found = 1;
+						if (item_count > 1)
+							break;
+					}
+				}
+				
+			}
+			if (found) {	// If the only item in the data block was removing item -> free data block
+				if (item_count == 1) {
+					remove_reference(dir->current, i);
+				}
+				
+				free(blocks);
+				return NO_ERROR;
+			}
+			prev = blocks[i];
+		}
+	}
 	return ERROR;
 }
 
 
+/*	Remove reference to the data block from i-node (except data block of direct1)
+	(+from the file with indirect references)
+
+	param item ... directory in which we remove data block
+	param block_id ... number of the removing data block
+*/
+void remove_reference(directory_item *item, int32_t block_id) {
+	int i, j, max_numbers = 256;
+	int32_t number, count, found, zero = 0, blocks[2];
+	inode *node = &inodes[item->inode];
+	
+	if (node->direct1 == block_id) {	// First direct block is not removing
+		return;
+	}
+	else if (node->direct2 == block_id) {
+		blocks[0] = node->direct2;
+		node->direct2 = FREE;
+	}
+	else if (node->direct3 == block_id) {
+		blocks[0] = node->direct3;
+		node->direct3 = FREE;
+	}
+	else if (node->direct4 == block_id) {
+		blocks[0] = node->direct4;
+		node->direct4 = FREE;
+	}
+	else if (node->direct5 == block_id) {
+		blocks[0] = node->direct5;
+		node->direct5 = FREE;
+	}
+	else {
+		for (i = 0; i < 2; i++) {
+			if (i == 0)	// Go through indirect1
+				fseek(fs, sb->data_start_address + node->indirect1 * CLUSTER_SIZE, SEEK_SET);
+			else 		// Go through indirect2
+				fseek(fs, sb->data_start_address + node->indirect2 * CLUSTER_SIZE, SEEK_SET);
+			
+			count = 0;
+			found = 0;
+			for (j = 0; j < max_numbers; j++) {
+				fread(&number, sizeof(int32_t), 1, fs);
+				if (number > 0) 
+					count++;
+				if (!found) {
+					if (number == block_id) {
+						found = 1;
+						blocks[0] = number;
+						fseek(fs, -4, SEEK_CUR);
+						fflush(fs);
+						fwrite(&zero, sizeof(int32_t), 1, fs);
+						fflush(fs);
+						if (count > 1)
+							break;
+					}
+				}
+			}
+			
+			if (found) {
+				if (count == 1) {
+					if (i == 0) {
+						blocks[1] = node->indirect1;
+						node->indirect1 = FREE;
+					}
+					else {
+						blocks[1] = node->indirect2;
+						node->indirect2 = FREE;
+					}
+				}
+				break;
+			}
+			
+		}
+	}
+	
+	update_bitmap(item, 0, blocks, 1);
+	update_inode(item->inode);
+}
 
