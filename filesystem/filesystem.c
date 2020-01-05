@@ -16,6 +16,8 @@
 
 #define BUFF_SIZE 256				// Buffer size for input commands
 #define CLUSTER_SIZE 1024
+#define INODE_SIZE 38			// Size of the i-node in bytes
+#define MAX_NUMBERS_IN_BLOCK 256
 #define MAX_SIZE 529408				// Maximum size of the file which can be stored in the filesystem (517 * 1024)
 #define ERROR -1
 #define NO_ERROR 0
@@ -29,7 +31,7 @@
 #define CCF "CANNOT CREATE FILE\n"
 #define NES "FILESYSTEM HAS NOT ENOUGH SPACE\n"
 
-
+// Structure of supeblock
 struct superblock {
     int32_t disk_size;              // Filesystem size
     int32_t cluster_size;           // Cluster size
@@ -43,7 +45,7 @@ struct superblock {
     int32_t data_start_address;     // Start address of data blocks  
 };
 
-
+// Structure of i-node
 typedef struct theinode {
     int32_t nodeid;                 // i-node ID, if ID = ID_ITEM_FREE, then i-node is free
     int8_t isDirectory;             // 0 = file, 1 = directory
@@ -58,14 +60,14 @@ typedef struct theinode {
 	int32_t indirect2;              // 2. indirect reference 
 } inode;
 
-
+// Structure of directory item
 typedef struct thedirectory_item{
     int32_t inode;               	// i-node ID (index to array)
     char item_name[12];             // File name 8+3 + \0
 	struct thedirectory_item *next;	// Reference to another directory item in the current directory 
 } directory_item;
 
-
+// Structure of directory
 typedef struct thedirectory {
 	struct thedirectory *parent;	// Reference to the parent directory
 	directory_item *current;		// Current directory item
@@ -73,12 +75,13 @@ typedef struct thedirectory {
 	directory_item *file;			// Reference to the first file in the list of all files in the current directory
 } directory;	
 
-
+// Structure of info. about particular data block
 typedef struct thedata_info {
 	int32_t nodeid;				// I-node id which contains this data block
 	int32_t *ref_addr;			// Address of the direct/indirect reference where this data block is stored
 								// NULL - if this data block is only in the block referenced by indirect reference
-	long addr_in_indirect;		// address in the file where number of this block is stored
+	int32_t indir_block;		// number of data block of indirect reference
+	int32_t order_in_block;		// Location in the indirect data block (order of number)
 } data_info;
 
 
@@ -100,6 +103,12 @@ void defrag();
 
 int run();
 void shutdown();
+
+int is_sorted(int32_t *blocks, int count);
+data_info *create_data_info(int32_t nodeid, int32_t *ref_addr, int32_t indir_block, int32_t order_in_block);
+data_info **map_data_blocks(int *count_of_full_blocks);
+void switch_blocks(int from, int to, data_info **info_blocks);
+
 int32_t get_size(char *size);
 int32_t find_free_inode();
 int32_t *find_free_data_blocks(int count);
@@ -118,18 +127,13 @@ void print_info(directory_item *item);
 void print_file(directory_item *item);
 void print_format_msg();
 
-data_info *create_data_info(int32_t nodeid, int32_t *ref_addr, long addr_in_indirect);
-data_info **map_data_blocks(int *count_of_full_blocks);
-void switch_blocks(int from, int to, data_info **info_blocks);
-
-void update_bitmap(directory_item *item, int8_t value, int32_t *data_blocks, int b_count);
-void update_inode(int id);
 void load_fs();
 void load_directory(directory *dir, int id);
+void update_bitmap(directory_item *item, int8_t value, int32_t *data_blocks, int b_count);
+void update_inode(int id);
 int update_directory(directory *dir, directory_item *item, int action);
 void remove_reference(directory_item *item, int32_t block_id);
 
-const int32_t INODE_SIZE = 38;			// Size of the i-node in bytes
 const int32_t FREE = -1;					// item is free
 const char *DELIM = " \n"; 
 
@@ -142,7 +146,7 @@ directory **directories = NULL;			// Array of pointers to directories, i-node ID
 directory *working_directory;			// Current directory
 int fs_formatted;						// If filesystem is formatted, 0 = false, 1 = true
 char block_buffer[CLUSTER_SIZE];		// Buffer for one cluster 
-int file_input = 0;
+int file_input = 0;						// If commands are loaded from a file
 
 
 /* 	***************************************************
@@ -181,24 +185,24 @@ int run() {
 	short exit = 0;	
 	char buffer[BUFF_SIZE];	// User commands buffer
 	char *cmd, *args;
-	FILE *f;	// File from which can be loaded commands instead of console
-	int32_t fs_size;	// Size of the filesystem
+	FILE *f;				// File from which can be loaded commands instead of console
+	int32_t fs_size;		// Size of the filesystem
 	
 	do {
 		memset(buffer, 0, BUFF_SIZE);
 
-		if (file_input) {	// Commands from the file
+		if (file_input) {		// Commands from the file
 			fgets(buffer, BUFF_SIZE, f);
 			if (!feof(f)) {
 				printf("%s", buffer);
 			}
-			else { // Switch back to the commands from the console
+			else { 				// Switch back to the commands from the console
 				file_input = 0;
 				fclose(f);
 				continue;
 			}
 		}
-		else {				// Commands from the console
+		else {					// Commands from the console
 			fgets(buffer, BUFF_SIZE, stdin);
 		}
 		
@@ -278,7 +282,6 @@ void shutdown() {
 	fclose(fs);
 }
 
-/*	******************************** Filesystem commands *********************************	*/
 
 /*	Copy file to another directory
 
@@ -401,8 +404,7 @@ void cp(char *files) {
 	free(source_blocks);
 	free(dest_blocks);
 	
-	printf(OK);
-	
+	printf(OK);	
 }
 
 
@@ -420,7 +422,7 @@ void mv(char *files) {
 		return;	
 	}
 	
-	if (!files || files == "") { // No arguments
+	if (!files || files == "") { 	// No arguments
 		printf(FNF);
 		return;
 	}
@@ -526,7 +528,7 @@ void rm(char *file) {
 			(*temp) = item->next;
 			break;
 		}
-		(*temp) = item->next;
+		temp = &(item->next);
 		item = item->next;
 	}
 	
@@ -663,15 +665,12 @@ void myrmdir(char *path) {
 			}
 			
 			update_bitmap(item, 0, NULL, 0);
-			
 			clear_inode(item->inode);
 			update_inode(item->inode);
-
 			update_directory(dir, item, 0);
 
 			free(directories[item->inode]);
 			free(item);
-
 			break;
 		}
 		temp = &(item->next);
@@ -902,15 +901,21 @@ void incp(char *files) {
 		name++;
 	}
 	
-	if (!(f = fopen(source, "rb"))) {
-		printf(FNF);
-		return;
-	}
-	
 	// Find destination directory
 	dir = find_directory(dest);
 	if (!dir) {
 		printf(PNF);
+		return;
+	}
+	
+	// Test if destination folder doesn't contain file with the same name
+	if (test_existence(dir, name)) {
+		printf(EXIST);
+		return;
+	}
+	
+	if (!(f = fopen(source, "rb"))) {
+		printf(FNF);
 		return;
 	}
 	
@@ -921,6 +926,7 @@ void incp(char *files) {
 	
 	if (file_size > MAX_SIZE) {
 		printf(TL);
+		fclose(f);
 		return;
 	}
 	
@@ -940,6 +946,7 @@ void incp(char *files) {
 	blocks = find_free_data_blocks(tmp_count);
 	if (!blocks) {
 		printf(NES);
+		fclose(f);
 		return;
 	}
 	
@@ -947,6 +954,7 @@ void incp(char *files) {
 	inode_id = find_free_inode();
 	if (inode_id == ERROR) {
 		printf(NES);
+		fclose(f);
 		return;
 	}
 	
@@ -963,8 +971,8 @@ void incp(char *files) {
 	update_inode(inode_id);
 	update_directory(dir, *pitem, 1);
 	update_sizes(dir, file_size);
-
 	
+	// Copy data
 	prev = blocks[0];
 	for (i = 0; i < block_count - 1; i++) {
 		fread(block_buffer, sizeof(block_buffer), 1, f);
@@ -1045,6 +1053,7 @@ void outcp(char *files) {
 	
 	blocks = get_data_blocks(item->inode, &block_count, &rest);
 
+	// Copy data
 	prev = blocks[0];
 	for (i = 0; i < block_count - 1; i++) {
 		if (prev != (blocks[i] - 1)) {	// If data blocks are not in sequence
@@ -1110,8 +1119,6 @@ void format(long bytes) {
 		fs = fopen(fs_name, "wb+");
 	}
 	
-	printf("Formating...\n");
-	
 	// Prepare superblock
 	if (!fs_formatted) {		// If not exist -> create
 		sb = (struct superblock *)malloc(sizeof(struct superblock));
@@ -1133,8 +1140,8 @@ void format(long bytes) {
 	sb->data_start_address = sb->inode_start_address + CLUSTER_SIZE * sb->inode_cluster_count;					// Initial address of data blocks
 	
 	
-	printf("Size: %d\nCount of clusters: %d\nCount of i-nodes: %d\nCount of bitmap blocks: %d\nCount of i-node blocks: %d\nCount of data blocks: %d\nAddress of bitmap: %d\nAddress of i-nodes: %d\nAddress of data: %d\n", 
-	sb->disk_size, sb->cluster_count, sb->inode_count, sb->bitmap_cluster_count, sb->inode_cluster_count, sb->data_cluster_count, sb->bitmap_start_address, sb->inode_start_address, sb->data_start_address);
+//	printf("Size: %d\nCount of clusters: %d\nCount of i-nodes: %d\nCount of bitmap blocks: %d\nCount of i-node blocks: %d\nCount of data blocks: %d\nAddress of bitmap: %d\nAddress of i-nodes: %d\nAddress of data: %d\n", 
+//	sb->disk_size, sb->cluster_count, sb->inode_count, sb->bitmap_cluster_count, sb->inode_cluster_count, sb->data_cluster_count, sb->bitmap_start_address, sb->inode_start_address, sb->data_start_address);
 	
 	if (fs_formatted) {		// If filesystem has already been formatted 
 		free(bitmap);
@@ -1227,15 +1234,16 @@ void format(long bytes) {
 }
 
 
+/*	Defragment filesystem - first shift all data blocks to the begin of file (remove spaces between data blocks)
+	and then reorder not consecutive data blocks belonging to one i-node
+*/
 void defrag() {
 	int32_t i, j, k, l, tmp, rest, count_of_full_blocks = 0;
 	int32_t *blocks, *blocks2;
-	short unsorted_inodes[sb->inode_count];	// bitmap of i-nodes which are unsorted		1 = unsorted,	0 = sorted
 	short changed_inodes[sb->inode_count];	// bitmap of i-nodes which were modified	1 = changed, 0 = unchanged
 	int inode_block_count[sb->inode_count];	// count of data blocks for every i-node
-	int32_t **data_blocks;		// array of data blocks for every i-node
-	data_info **info_blocks;
-	
+	int32_t **data_blocks;					// array of data blocks for every i-node
+	data_info **info_blocks;				// array of information for every full data block
 	
 	if (!fs_formatted) {
 		print_format_msg();
@@ -1273,14 +1281,6 @@ void defrag() {
 			}
 			inode_block_count[i] += tmp;
 		}
-
-		// test if data blocks are sorted
-		for (j = 1; j < inode_block_count[i]; j++) {
-			if (data_blocks[i][j - 1] != (data_blocks[i][j] - 1)) {
-				unsorted_inodes[i] = 1;
-				break;	
-			}
-		}
 	}
 
 	// Rearrange data blocks so that free blocks were after full blocks
@@ -1299,31 +1299,30 @@ void defrag() {
 
 	// Rearrange data blocks so that blocks of one i-node were consecutive
 	i = 0;
-	while (i < count_of_full_blocks) {
-		
-		if (!(unsorted_inodes[info_blocks[i]->nodeid])) {
+	while (i < count_of_full_blocks) {	// Iteration over full data blocks
+		blocks = data_blocks[info_blocks[i]->nodeid];	// get all data blocks of the i-node to which current data block belongs
+			
+		if (is_sorted(blocks, inode_block_count[info_blocks[i]->nodeid])) {	// if data blocks are already sorted -> skip to another data block of other i-node
 			i += inode_block_count[info_blocks[i]->nodeid];
 			continue;
 		}
 
-		blocks = data_blocks[info_blocks[i]->nodeid];
-
 		for (j = i, k = 0; j < (i + inode_block_count[info_blocks[i]->nodeid]); j++, k++) {
-			if (j == blocks[k]) {
+			if (j == blocks[k]) 
 				continue;
-			}
 			
-			switch_blocks(blocks[k], j, info_blocks);
-			tmp = blocks[k];
-			blocks[k] = j;
+			changed_inodes[info_blocks[j]->nodeid] = 1;
+			changed_inodes[info_blocks[blocks[k]]->nodeid] = 1;
 			
-			blocks2 = data_blocks[info_blocks[j]->nodeid];
-			for (l = 0; l < inode_block_count[info_blocks[i]->nodeid]; l++) {
+			blocks2 = data_blocks[info_blocks[j]->nodeid];	// data blocks of the destination
+			for (l = 0; l < inode_block_count[info_blocks[j]->nodeid]; l++) {
 				if (j == blocks2[l]) {
-					blocks2[l] = tmp;
+					blocks2[l] = blocks[k];
 					break;
 				}
 			}
+			switch_blocks(blocks[k], j, info_blocks);
+			blocks[k] = j;
 		}
 		i += inode_block_count[info_blocks[i]->nodeid];
 	}
@@ -1356,22 +1355,56 @@ void defrag() {
 		free(info_blocks[i]);
 	}
 	free(info_blocks);
+	
+	printf(OK);
 }
 
 
-/* 	**************************************************************************************	*/
+/*	Test if data blocks are consecutive
 
-data_info *create_data_info(int32_t nodeid, int32_t *ref_addr, long addr_in_indirect) {
+	param blocks ... data blocks
+	param count ... count of blocks
+	return 0 = unsorted, 1 = sorted
+*/
+int is_sorted(int32_t *blocks, int count) {
+	int i;
+	
+	for (i = 1; i < count; i++) {
+		if (blocks[i - 1] != (blocks[i] - 1)) {
+			return 0;	
+		}
+	}
+	return 1;
+}
+
+
+/*	Create a data info for the specific data block
+
+	param nodeid ... i-node id to which belongs this data block
+	param ref_addr ... address where is stored number of this data block (in i-node)
+	param indir_block ... number of data block which is indirect reference
+	param order_in_block ... if this data block is stored in the indirect reference -> order in that block
+	return info about this data block
+*/ 
+data_info *create_data_info(int32_t nodeid, int32_t *ref_addr, int32_t indir_block, int32_t order_in_block) {
 	data_info *block = (data_info *)malloc(sizeof(data_info));
 	block->nodeid = nodeid;
 	block->ref_addr = ref_addr;
-	block->addr_in_indirect = addr_in_indirect;
+	block->indir_block = indir_block;
+	block->order_in_block = order_in_block;
+	
+	return block;
 }
 
+
+/*	Create an array of information for every full data block
+
+	param count_of_full_blocks ... count of used data blocks
+	return array of information
+*/
 data_info **map_data_blocks(int *count_of_full_blocks) {
 	int i, j;
 	int32_t number;
-	long addr_in_indir;
 	data_info **blocks = (data_info **)malloc(sizeof(data_info *) * sb->data_cluster_count);
 	for (i = 0; i < sb->data_cluster_count; i++) {
 		blocks[i] = NULL;
@@ -1382,47 +1415,45 @@ data_info **map_data_blocks(int *count_of_full_blocks) {
 			continue;
 			
 		if (inodes[i].direct1 != FREE) {
-			blocks[inodes[i].direct1] = create_data_info(inodes[i].nodeid, &(inodes[i].direct1), 0);
+			blocks[inodes[i].direct1] = create_data_info(inodes[i].nodeid, &(inodes[i].direct1), 0, 0);
 			(*count_of_full_blocks)++;
 		}
 		if (inodes[i].direct2 != FREE) {
-			blocks[inodes[i].direct2] = create_data_info(inodes[i].nodeid, &(inodes[i].direct2), 0);
+			blocks[inodes[i].direct2] = create_data_info(inodes[i].nodeid, &(inodes[i].direct2), 0, 0);
 			(*count_of_full_blocks)++;
 		}
 		if (inodes[i].direct3 != FREE) {
-			blocks[inodes[i].direct3] = create_data_info(inodes[i].nodeid, &(inodes[i].direct3), 0);
+			blocks[inodes[i].direct3] = create_data_info(inodes[i].nodeid, &(inodes[i].direct3), 0, 0);
 			(*count_of_full_blocks)++;
 		}
 		if (inodes[i].direct4 != FREE) {
-			blocks[inodes[i].direct4] = create_data_info(inodes[i].nodeid, &(inodes[i].direct4), 0);
+			blocks[inodes[i].direct4] = create_data_info(inodes[i].nodeid, &(inodes[i].direct4), 0, 0);
 			(*count_of_full_blocks)++;
 		}
 		if (inodes[i].direct5 != FREE) {
-			blocks[inodes[i].direct5] = create_data_info(inodes[i].nodeid, &(inodes[i].direct5), 0);
+			blocks[inodes[i].direct5] = create_data_info(inodes[i].nodeid, &(inodes[i].direct5), 0, 0);
 			(*count_of_full_blocks)++;
 		}
 		if (inodes[i].indirect1 != FREE) {
-			blocks[inodes[i].indirect1] = create_data_info(inodes[i].nodeid, &(inodes[i].indirect1), 0);
+			blocks[inodes[i].indirect1] = create_data_info(inodes[i].nodeid, &(inodes[i].indirect1), inodes[i].indirect1, 0);
 			(*count_of_full_blocks)++;
 			fseek(fs, sb->data_start_address + inodes[i].indirect1 * CLUSTER_SIZE, SEEK_SET);
-			for (j = 0; j < 256; j++) {
+			for (j = 0; j < MAX_NUMBERS_IN_BLOCK; j++) {
 				fread(&number, sizeof(int32_t), 1, fs);
 				if (number > 0) {
-					addr_in_indir = ftell(fs) - 4;
-					blocks[number] = create_data_info(inodes[i].nodeid, NULL, addr_in_indir);
+					blocks[number] = create_data_info(inodes[i].nodeid, NULL, inodes[i].indirect1, j);
 					(*count_of_full_blocks)++;
 				}
 			}
 		}
 		if (inodes[i].indirect2 != FREE) {
-			blocks[inodes[i].indirect2] = create_data_info(inodes[i].nodeid, &(inodes[i].indirect2), 0);
+			blocks[inodes[i].indirect2] = create_data_info(inodes[i].nodeid, &(inodes[i].indirect2), inodes[i].indirect2, 0);
 			(*count_of_full_blocks)++;
 			fseek(fs, sb->data_start_address + inodes[i].indirect2 * CLUSTER_SIZE, SEEK_SET);
-			for (j = 0; j < 256; j++) {
+			for (j = 0; j < MAX_NUMBERS_IN_BLOCK; j++) {
 				fread(&number, sizeof(int32_t), 1, fs);
 				if (number > 0) {
-					addr_in_indir = ftell(fs) - 4;
-					blocks[number] = create_data_info(inodes[i].nodeid, NULL, addr_in_indir);
+					blocks[number] = create_data_info(inodes[i].nodeid, NULL, inodes[i].indirect2, j);
 					(*count_of_full_blocks)++;
 				}
 			}
@@ -1434,17 +1465,36 @@ data_info **map_data_blocks(int *count_of_full_blocks) {
 }
 
 
+/*	Switch two data blocks
 
+	param from ... number of the first data block
+	param to ... number of the second data block
+	param info_blocks ... array of information of all data blocks
+*/ 
 void switch_blocks(int from, int to, data_info **info_blocks) {
+	int i;
+	int32_t number;
 	data_info *tmp;
 	char tmp_buffer[CLUSTER_SIZE];
-	
+
 	// Update source (from) i-node
 	if (info_blocks[from]->ref_addr != NULL) {
+		if (info_blocks[from]->indir_block > 0) {		// indirect reference -> change data block number to all blocks in this indirect reference
+			fseek(fs, sb->data_start_address + info_blocks[from]->indir_block * CLUSTER_SIZE, SEEK_SET);
+			for (i = 0; i < MAX_NUMBERS_IN_BLOCK; i++) {
+				fread(&number, sizeof(int32_t), 1, fs);
+				if (number > 0) {
+					info_blocks[number]->indir_block = to;
+				}
+			}
+			fflush(fs);
+			info_blocks[from]->indir_block = to;
+		}
 		*(info_blocks[from]->ref_addr) = to; 
+		
 	}
-	else {
-		fseek(fs, info_blocks[from]->addr_in_indirect, SEEK_SET);
+	else {	// is in the data block of indirect reference	
+		fseek(fs, sb->data_start_address + info_blocks[from]->indir_block * CLUSTER_SIZE + info_blocks[from]->order_in_block * sizeof(int32_t), SEEK_SET);
 		fwrite(&to, sizeof(int32_t), 1, fs);
 		fflush(fs);
 	}
@@ -1463,10 +1513,21 @@ void switch_blocks(int from, int to, data_info **info_blocks) {
 		
 		// Update destination (to) i-node
 		if (info_blocks[to]->ref_addr != NULL) {
+			if (info_blocks[to]->indir_block > 0) {		// indirect reference -> change data block number to all blocks in this indirect reference
+				fseek(fs, sb->data_start_address + *(info_blocks[to]->ref_addr) * CLUSTER_SIZE, SEEK_SET);
+				for (i = 0; i < MAX_NUMBERS_IN_BLOCK; i++) {
+					fread(&number, sizeof(int32_t), 1, fs);
+					if (number > 0) {
+						info_blocks[number]->indir_block = from;
+					}
+				}
+				fflush(fs);
+				info_blocks[to]->indir_block = from;
+			}
 			*(info_blocks[to]->ref_addr) = from; 
 		}
-		else {
-			fseek(fs, info_blocks[to]->addr_in_indirect, SEEK_SET);
+		else {		
+			fseek(fs, sb->data_start_address + info_blocks[to]->indir_block * CLUSTER_SIZE + info_blocks[to]->order_in_block * sizeof(int32_t), SEEK_SET);
 			fwrite(&from, sizeof(int32_t), 1, fs);
 			fflush(fs);
 		}
@@ -1493,6 +1554,7 @@ void switch_blocks(int from, int to, data_info **info_blocks) {
 	fwrite(tmp_buffer, sizeof(tmp_buffer), 1, fs);
 	fflush(fs);
 }
+
 
 /*	Validate entered size of the filesystem
 	and convert it into bytes
@@ -1539,7 +1601,7 @@ int32_t get_size(char *size) {
 }
 
 
-/*	Find free i-node
+/*	Find a free i-node
 	
 	return ... i-node ID or -1 if no i-node is free
 */
@@ -1569,10 +1631,10 @@ int32_t *find_free_data_blocks(int count) {
 		if (bitmap[i] == 0) {
 			if ((j != 0) && (blocks[j - 1] != (i - 1))) {
 				j = 0;
+				i--;
 				continue;
 			}
-			blocks[j] = i;
-			j++;
+			blocks[j++] = i;
 			if (j == count) {
 				return blocks;
 			}
@@ -1605,7 +1667,6 @@ int32_t *get_data_blocks(int32_t nodeid, int *block_count, int *rest) {
 	int32_t *blocks, number;
 	int i, tmp, counter;
 	int max_numbers = 517;	// Maximum data blocks 
-	int max_numbers_in_block = 256;
 	inode *node = &inodes[nodeid];
 	
 	if (node->isDirectory) {	// If item is directory
@@ -1629,7 +1690,7 @@ int32_t *get_data_blocks(int32_t nodeid, int *block_count, int *rest) {
 		}	
 		if (node->indirect1 != FREE) {
 			fseek(fs, sb->data_start_address + node->indirect1 * CLUSTER_SIZE, SEEK_SET);
-			for (i = 0; i < max_numbers_in_block; i++) {
+			for (i = 0; i < MAX_NUMBERS_IN_BLOCK; i++) {
 				fread(&number, sizeof(int32_t), 1, fs);
 				if (number > 0) {
 					blocks[counter++] = number;
@@ -1638,7 +1699,7 @@ int32_t *get_data_blocks(int32_t nodeid, int *block_count, int *rest) {
 		}
 		if (node->indirect2 != FREE) {
 			fseek(fs, sb->data_start_address + node->indirect2 * CLUSTER_SIZE, SEEK_SET);
-			for (i = 0; i < max_numbers_in_block; i++) {
+			for (i = 0; i < MAX_NUMBERS_IN_BLOCK; i++) {
 				fread(&number, sizeof(int32_t), 1, fs);
 				if (number > 0) {
 					blocks[counter++] = number;
@@ -1669,7 +1730,7 @@ int32_t *get_data_blocks(int32_t nodeid, int *block_count, int *rest) {
 							if (*block_count > 261) {	// Both indirect references are used
 								// Read all data blocks of indirect1
 								fseek(fs, sb->data_start_address + node->indirect1 * CLUSTER_SIZE, SEEK_SET);
-								fread(&blocks[5], sizeof(int32_t), max_numbers_in_block, fs);
+								fread(&blocks[5], sizeof(int32_t), MAX_NUMBERS_IN_BLOCK, fs);
 								
 								// Read the rest of indirect2
 								tmp = *block_count - 261;
@@ -1715,7 +1776,7 @@ directory_item *find_item(directory_item *first_item, char *name) {
 
 	param path ... path + name of file/directory
 	param name ... address to store name of the file/directory
-	param name ... address to store founded directory
+	param dir ... address to store founded directory
 	return 0 = directory found, -1 = not found
 */
 int parse_path(char *path, char **name, directory **dir) {
@@ -1984,7 +2045,7 @@ void update_sizes(directory *dir, int32_t size) {
 	param item ... file or directory
 */
 void print_info(directory_item *item) {
-	int i, max_in_block = 256; // Maximum nambers in one data block
+	int i;
 	int32_t number; // Data block number
 	inode node = inodes[item->inode];
 	
@@ -2009,7 +2070,7 @@ void print_info(directory_item *item) {
 	if (node.indirect1 != FREE) {
 		printf(" (%d)", node.indirect1);
 		fseek(fs, sb->data_start_address + node.indirect1 * CLUSTER_SIZE, SEEK_SET);
-		for (i = 0; i < max_in_block; i++) {
+		for (i = 0; i < MAX_NUMBERS_IN_BLOCK; i++) {
 			fread(&number, sizeof(int32_t), 1, fs);
 			if (number == 0) 
 				break;
@@ -2019,14 +2080,13 @@ void print_info(directory_item *item) {
 	if (node.indirect2 != FREE) {
 		printf(" (%d)", node.indirect2);
 		fseek(fs, sb->data_start_address + node.indirect2 * CLUSTER_SIZE, SEEK_SET);
-		for (i = 0; i < max_in_block; i++) {
+		for (i = 0; i < MAX_NUMBERS_IN_BLOCK; i++) {
 			fread(&number, sizeof(int32_t), 1, fs);
 			if (number == 0) 
 				break;
 			printf(" %d", number);
 		}
 	}
-	
 	printf("\n");
 }
 
@@ -2115,7 +2175,7 @@ void initialize_inode(int32_t id, int32_t size, int block_count, int tmp_count, 
 							node->indirect2 = blocks[tmp_count - 2];
 							*last_block_index = tmp_count - 3;
 							fseek(fs, sb->data_start_address + node->indirect1 * CLUSTER_SIZE, SEEK_SET);
-							fwrite(&blocks[5], sizeof(int32_t), 256, fs);
+							fwrite(&blocks[5], sizeof(int32_t), MAX_NUMBERS_IN_BLOCK, fs);
 							
 							tmp = block_count - 261;
 							fseek(fs, sb->data_start_address + node->indirect2 * CLUSTER_SIZE, SEEK_SET);
@@ -2162,8 +2222,8 @@ void load_fs() {
 	fread(&(sb->inode_start_address), sizeof(int32_t), 1, fs);
 	fread(&(sb->data_start_address), sizeof(int32_t), 1, fs);
 	
-	printf("Size: %d\nCount of clusters: %d\nCount of i-nodes: %d\nCount of bitmap blocks: %d\nCount of i-node blocks: %d\nCount of data blocks: %d\nAddress of bitmap: %d\nAddress of i-nodes: %d\nAddress of data: %d\n", 
-	sb->disk_size, sb->cluster_count, sb->inode_count, sb->bitmap_cluster_count, sb->inode_cluster_count, sb->data_cluster_count, sb->bitmap_start_address, sb->inode_start_address, sb->data_start_address);
+//	printf("Size: %d\nCount of clusters: %d\nCount of i-nodes: %d\nCount of bitmap blocks: %d\nCount of i-node blocks: %d\nCount of data blocks: %d\nAddress of bitmap: %d\nAddress of i-nodes: %d\nAddress of data: %d\n", 
+//	sb->disk_size, sb->cluster_count, sb->inode_count, sb->bitmap_cluster_count, sb->inode_cluster_count, sb->data_cluster_count, sb->bitmap_start_address, sb->inode_start_address, sb->data_start_address);
 	
 	bitmap = (int8_t *)malloc(sb->data_cluster_count);
 	inodes = (inode *)malloc(sizeof(inode) * sb->inode_count);
@@ -2221,8 +2281,8 @@ void load_directory(directory *dir, int id) {
 	int i, j, block_count, rest;
 	int inode_count = 64;	// Maximum count of i-nodes in one data block
 	int32_t *blocks;		// Numbers of data blocks
-	int32_t nodeid;	// Item id
-	char name[12];	// Item name
+	int32_t nodeid;			// Item id
+	char name[12];			// Item name
 	directory *newdir;
 	directory_item *item, *temp;
 	directory_item **psubdir = &(dir->subdir);	// Address of the last (free) subdirectory in the list of subdirectories
@@ -2275,6 +2335,8 @@ void load_directory(directory *dir, int id) {
 
 	param item ... file/directory
 	param value ... 1 = use data blocks, 0 = free data blocks
+	param data_blocks ... data blocks of the item or NULL (directory)
+	param b_count ... count of blocks if not NULL
 */
 void update_bitmap(directory_item *item, int8_t value, int32_t *data_blocks, int b_count) {
 	int i, block_count, rest;
@@ -2332,8 +2394,7 @@ void update_inode(int id) {
 }
 
 
-
-/*	Update directory
+/*	Update directory - add/remove item from the file
 
 	param dir ... directory
 	param item ... item adding/removing to/from the directory
@@ -2411,7 +2472,6 @@ int update_directory(directory *dir, directory_item *item, int action) {
 				fwrite(&(free_block[0]), sizeof(int32_t), 1, fs);
 			}
 		}
-		
 
 		fseek(fs, sb->data_start_address + free_block[0] * CLUSTER_SIZE, SEEK_SET);
 		fwrite(&(item->inode), sizeof(int32_t), 1, fs);
@@ -2447,8 +2507,7 @@ int update_directory(directory *dir, directory_item *item, int action) {
 						if (item_count > 1)
 							break;
 					}
-				}
-				
+				}	
 			}
 			if (found) {	// If the only item in the data block was removing item -> free data block
 				if (item_count == 1) {
@@ -2535,7 +2594,6 @@ void remove_reference(directory_item *item, int32_t block_id) {
 				}
 				break;
 			}
-			
 		}
 	}
 	
