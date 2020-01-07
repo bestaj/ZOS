@@ -13,11 +13,13 @@
 #include <math.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 
 #define BUFF_SIZE 256				// Buffer size for input commands
-#define CLUSTER_SIZE 1024
-#define INODE_SIZE 38			// Size of the i-node in bytes
-#define MAX_NUMBERS_IN_BLOCK 256
+#define CLUSTER_SIZE 1024			// Size of the one cluster in bytes
+#define INODE_SIZE 38				// Size of the i-node in bytes
+#define MAX_NUMBERS_IN_BLOCK 256	// Count of numbers (integers) in one block
+#define MIN_FS_SIZE 20480			// Minimum size of the filesystem
 #define MAX_SIZE 529408				// Maximum size of the file which can be stored in the filesystem (517 * 1024)
 #define ERROR -1
 #define NO_ERROR 0
@@ -47,7 +49,7 @@ struct superblock {
 
 // Structure of i-node
 typedef struct theinode {
-    int32_t nodeid;                 // i-node ID, if ID = ID_ITEM_FREE, then i-node is free
+    int32_t nodeid;                 // i-node ID, if ID = FREE, then i-node is free
     int8_t isDirectory;             // 0 = file, 1 = directory
     int8_t references;              // Count of references to i-node
     int32_t file_size;              // Size of the file/directory in bytes
@@ -101,7 +103,7 @@ FILE *load(char *file);
 void format(long bytes);
 void defrag();
 
-int run();
+void run();
 void shutdown();
 
 int is_sorted(int32_t *blocks, int count);
@@ -181,7 +183,7 @@ int main(int argc, char *argv[]) {
 
 
 /*	Process user commands */
-int run() {
+void run() {
 	short exit = 0;	
 	char buffer[BUFF_SIZE];	// User commands buffer
 	char *cmd, *args;
@@ -253,7 +255,7 @@ int run() {
 			f = load(args);
 		}
 		else if (strcmp("format", cmd) == 0) {
-			fs_size = get_size(buffer + strlen(cmd) + 1);
+			fs_size = get_size(args);
 			if (fs_size == ERROR)		// Problem with the size of the filesystem
 				continue;
 			format(fs_size);
@@ -330,7 +332,7 @@ void cp(char *files) {
 		return;
 	}
 	
-	// Test if destination folder doesn't contain file/directory with the same name
+	// Test if destination folder contains file/directory with the same name
 	if (test_existence(dest_dir, name)) {
 		printf(EXIST);
 		return;
@@ -373,9 +375,9 @@ void cp(char *files) {
 	// Save changes to the file
 	update_bitmap(*pitem, 1, dest_blocks, block_count);
 	update_inode(inode_id);
-	update_directory(dest_dir, *pitem, 1);
 	update_sizes(dest_dir, inodes[item->inode].file_size);
-	
+	update_directory(dest_dir, *pitem, 1);
+		
 	// Copy data blocks
 	for (i = 0; i < block_count - 1; i++) {
 		fseek(fs, sb->data_start_address + source_blocks[i] * CLUSTER_SIZE, SEEK_SET);
@@ -415,7 +417,7 @@ void cp(char *files) {
 void mv(char *files) {
 	char *source, *dest, *name;
 	directory *source_dir, *dest_dir;
-	directory_item *item, **pitem2, **temp;
+	directory_item *item, **pitem, **temp;
 	
 	if (!fs_formatted) {
 		print_format_msg();
@@ -452,7 +454,7 @@ void mv(char *files) {
 		return;
 	}
 	
-	// Test if destination folder doesn't contain file/directory with the same name
+	// Test if destination folder contains file/directory with the same name
 	if (test_existence(dest_dir, name)) {
 		printf(EXIST);
 		return;
@@ -464,8 +466,8 @@ void mv(char *files) {
 	while (item != NULL) {
 		if (strcmp(name, item->item_name) == 0) {
 			(*temp) = item->next;
-			update_directory(source_dir, item, 0);
 			update_sizes(source_dir, -(inodes[item->inode].file_size));
+			update_directory(source_dir, item, 0);
 			break;
 		}
 		temp = &(item->next);
@@ -479,15 +481,15 @@ void mv(char *files) {
 	
 
 	// Get the last (free) item in the list of all files in the destination directory
-	pitem2 = &(dest_dir->file);
-	while (*pitem2 != NULL) {
-		pitem2 = &((*pitem2)->next);
+	pitem = &(dest_dir->file);
+	while (*pitem != NULL) {
+		pitem = &((*pitem)->next);
 	}
 	
-	*pitem2 = item;	// Add file to the destination directory
+	*pitem = item;	// Add file to the destination directory
 	
-	update_directory(dest_dir, item, 1);
 	update_sizes(dest_dir, inodes[item->inode].file_size);
+	update_directory(dest_dir, item, 1);
 	
 	printf(OK);
 }
@@ -1035,19 +1037,18 @@ void outcp(char *files) {
 		return;
 	}
 	
+	item = find_item(dir->file, name);
+	if (!item) {
+		printf(FNF);
+		return;
+	}
+	
 	// Set a whole destination (path + name)
 	memset(whole_dest, 0, BUFF_SIZE);
 	sprintf(whole_dest, "%s/%s", dest, name);
 	
 	if (!(f = fopen(whole_dest, "wb"))) {
 		printf(PNF);
-		return;
-	}
-	
-	item = find_item(dir->file, name);
-	
-	if (!item) {
-		printf(FNF);
 		return;
 	}
 	
@@ -1588,7 +1589,7 @@ int32_t get_size(char *size) {
 		number *= 1000000000;
 	}
 	
-	if (number < 20480) {			// If the size is not enough large 
+	if (number < MIN_FS_SIZE) {			// If the size is not enough large 
 		printf(CCF);
 		return ERROR;
 	}
@@ -1849,12 +1850,6 @@ int create_directory(directory *parent, char *name) {
 	inodes[inode_id].references = 1;
 	inodes[inode_id].file_size = 0;
 	inodes[inode_id].direct1 = data_block[0];
-	inodes[inode_id].direct2 = FREE;
-	inodes[inode_id].direct3 = FREE;
-	inodes[inode_id].direct4 = FREE;
-	inodes[inode_id].direct5 = FREE;
-	inodes[inode_id].indirect1 = FREE;
-	inodes[inode_id].indirect2 = FREE;
 	
 	
 	temp = &(parent->subdir);
@@ -1980,7 +1975,7 @@ directory *find_directory(char *path) {
 void free_directories(directory *root) {
 	directory_item *f, *d, *t;
 	
-	if (root) return;
+	if (!root) return;
 	
 	d = root->subdir;
 	while (d != NULL) {
@@ -2491,7 +2486,7 @@ int update_directory(directory *dir, directory_item *item, int action) {
 				fseek(fs, sb->data_start_address + blocks[i] * CLUSTER_SIZE, SEEK_SET);
 			}
 
-			item_count = 0;
+			item_count = 0;	// Counter of items in this data block
 			for (j = 0; j < max_items_in_block; j++) {
 				fread(&nodeid, sizeof(int32_t), 1, fs);
 				if (nodeid > 0)
@@ -2531,7 +2526,7 @@ int update_directory(directory *dir, directory_item *item, int action) {
 	param block_id ... number of the removing data block
 */
 void remove_reference(directory_item *item, int32_t block_id) {
-	int i, j, max_numbers = 256;
+	int i, j;
 	int32_t number, count, found, zero = 0, blocks[2];
 	inode *node = &inodes[item->inode];
 	
@@ -2563,7 +2558,7 @@ void remove_reference(directory_item *item, int32_t block_id) {
 			
 			count = 0;
 			found = 0;
-			for (j = 0; j < max_numbers; j++) {
+			for (j = 0; j < MAX_NUMBERS_IN_BLOCK; j++) {
 				fread(&number, sizeof(int32_t), 1, fs);
 				if (number > 0) 
 					count++;
